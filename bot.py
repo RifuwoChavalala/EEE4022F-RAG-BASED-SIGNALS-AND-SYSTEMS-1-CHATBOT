@@ -8,6 +8,7 @@ import tempfile
 import textwrap
 import warnings
 import time
+import unicodedata
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -69,7 +70,6 @@ async def _safe_reply(update: Update, text: str,
                       parse_mode: str | None = None,
                       retries: int = 3,
                       delay: float = 3.0) -> None:
-    """Send a text reply with automatic retry on network timeout."""
     for attempt in range(1, retries + 1):
         try:
             await update.message.reply_text(text, parse_mode=parse_mode)
@@ -85,7 +85,6 @@ async def _safe_reply_photo(update: Update, path: str,
                              caption: str = "",
                              retries: int = 3,
                              delay: float = 5.0) -> bool:
-    """Send a photo reply with automatic retry."""
     for attempt in range(1, retries + 1):
         try:
             with open(path, "rb") as f:
@@ -265,9 +264,238 @@ def _is_math_title(title: str) -> bool:
     return any(kw in t for kw in _MATH_TITLE_KEYWORDS)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LATEX / MATHTEXT SANITISER
+# LLM RESPONSE CLEANER
+# ══════════════════════════════════════════════════════════════════════════════
+# Patterns the LLM emits that should be stripped before display
+_LLM_PREAMBLE_RE = re.compile(
+    r"(?:"
+    r"I(?:'ll|'d| will| would)[\s\S]{0,80}?(?:help|assist|answer)[\s\S]{0,120}?\n+"
+    r"|(?:Sure|Certainly|Of course|Absolutely|Great)[!,.][\s\S]{0,120}?\n+"
+    r"|(?:\*\*)?Classification(?:\*\*)?:.*?(?:\n|$)"
+    r"|(?:\*\*)?Question(?:\*\*)?:.*?(?:\n|$)"
+    r"|(?:\*\*)?Answer(?:\*\*)?:\s*"
+    r")",
+    re.IGNORECASE,
+)
+
+def _clean_llm_response(text: str) -> str:
+    """
+    Remove boilerplate preambles the LLM prepends, e.g.:
+      "I'll be happy to help … **Classification:** C) … **Question:** … **Answer:**"
+    Also strip leading/trailing blank lines.
+    """
+    # Iteratively remove preamble patterns until none remain at the start
+    for _ in range(8):
+        stripped = _LLM_PREAMBLE_RE.sub("", text, count=1).lstrip()
+        if stripped == text.lstrip():
+            break
+        text = stripped
+    return text.strip()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LATEX → PLAIN-TEXT / UNICODE CONVERTER
+# ══════════════════════════════════════════════════════════════════════════════
+# Maps LaTeX commands → unicode / plain text
+_LATEX_UNICODE = {
+    r'\omega':   'ω',
+    r'\Omega':   'Ω',
+    r'\alpha':   'α',
+    r'\beta':    'β',
+    r'\gamma':   'γ',
+    r'\delta':   'δ',
+    r'\Delta':   'Δ',
+    r'\epsilon': 'ε',
+    r'\zeta':    'ζ',
+    r'\eta':     'η',
+    r'\theta':   'θ',
+    r'\Theta':   'Θ',
+    r'\lambda':  'λ',
+    r'\Lambda':  'Λ',
+    r'\mu':      'μ',
+    r'\nu':      'ν',
+    r'\xi':      'ξ',
+    r'\pi':      'π',
+    r'\Pi':      'Π',
+    r'\rho':     'ρ',
+    r'\sigma':   'σ',
+    r'\Sigma':   'Σ',
+    r'\tau':     'τ',
+    r'\phi':     'φ',
+    r'\Phi':     'Φ',
+    r'\chi':     'χ',
+    r'\psi':     'ψ',
+    r'\Psi':     'Ψ',
+    r'\infty':   '∞',
+    r'\cdot':    '·',
+    r'\times':   '×',
+    r'\approx':  '≈',
+    r'\geq':     '≥',
+    r'\leq':     '≤',
+    r'\neq':     '≠',
+    r'\pm':      '±',
+    r'\to':      '→',
+    r'\rightarrow': '→',
+    r'\leftarrow':  '←',
+    r'\int':     '∫',
+    r'\sum':     'Σ',
+    r'\prod':    'Π',
+    r'\partial': '∂',
+    r'\nabla':   '∇',
+    r'\in':      '∈',
+    r'\notin':   '∉',
+    r'\subset':  '⊂',
+    r'\cup':     '∪',
+    r'\cap':     '∩',
+    r'\forall':  '∀',
+    r'\exists':  '∃',
+    r'\sqrt':    '√',
+    r'\star':    '★',
+}
+
+# Superscript/subscript digit maps
+_SUP_DIGITS = str.maketrans('0123456789+-', '⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻')
+_SUB_DIGITS = str.maketrans('0123456789+-', '₀₁₂₃₄₅₆₇₈₉₊₋')
+
+
+def _frac_to_text(num: str, den: str) -> str:
+    """Render \frac{num}{den} as num/den."""
+    return f"({num.strip()}/{den.strip()})"
+
+
+def _latex_to_plain(text: str) -> str:
+    """
+    Convert inline LaTeX ($...$  or  $$...$$) to readable plain-text / unicode.
+    Leaves non-math text untouched.
+    """
+    def _convert_math(expr: str) -> str:
+        s = expr
+
+        # \begin{cases}...\end{cases} → piecewise plain text
+        def _cases(m):
+            inner = m.group(1)
+            branches = [b.strip() for b in re.split(r'\\\\', inner) if b.strip()]
+            parts = []
+            for b in branches:
+                b = re.sub(r'\s*&\s*', ',  ', b).strip()
+                parts.append(_convert_math(b))
+            return '{ ' + ' ; '.join(parts) + ' }'
+        s = re.sub(r'\\begin\s*\{cases\}([\s\S]*?)\\end\s*\{cases\}', _cases, s)
+
+        # \frac{a}{b}
+        def _frac(m):
+            return _frac_to_text(m.group(1), m.group(2))
+        s = re.sub(r'\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}', _frac, s)
+
+        # \mathcal{X}, \mathbf{X}, \mathrm{X}, \text{X}, \operatorname{X}, \rm X
+        s = re.sub(r'\\(?:mathcal|mathbf|mathrm|text|operatorname)\s*\{([^}]*)\}', r'\1', s)
+        s = re.sub(r'\\rm\s+([A-Za-z]+)', r'\1', s)
+
+        # Greek letters and symbols
+        for cmd, uni in sorted(_LATEX_UNICODE.items(), key=lambda x: -len(x[0])):
+            s = s.replace(cmd, uni)
+
+        # \left / \right
+        s = re.sub(r'\\(?:left|right)\s*', '', s)
+
+        # Superscripts: ^{...} or ^x
+        def _sup(m):
+            inner = (m.group(1) or m.group(2) or '').strip()
+            # try digit-only translation
+            try:
+                return inner.translate(_SUP_DIGITS)
+            except Exception:
+                return f"^({inner})" if len(inner) > 1 else f"^{inner}"
+        s = re.sub(r'\^\{([^}]*)\}|\^([A-Za-z0-9])', _sup, s)
+
+        # Subscripts: _{...} or _x
+        def _sub(m):
+            inner = (m.group(1) or m.group(2) or '').strip()
+            try:
+                return inner.translate(_SUB_DIGITS)
+            except Exception:
+                return f"_({inner})" if len(inner) > 1 else f"_{inner}"
+        s = re.sub(r'_\{([^}]*)\}|_([A-Za-z0-9])', _sub, s)
+
+        # spacing commands
+        s = re.sub(r'\\(?:quad|qquad|,|;|:|\s)', ' ', s)
+
+        # remaining backslash commands — just drop the backslash
+        s = re.sub(r'\\([A-Za-z]+)', r'\1', s)
+
+        # clean up extra braces/spaces
+        s = re.sub(r'[{}]', '', s)
+        s = re.sub(r'  +', ' ', s).strip()
+        return s
+
+    # Replace $$...$$ blocks
+    def _replace_display(m):
+        return '\n' + _convert_math(m.group(1).strip()) + '\n'
+
+    text = re.sub(r'\$\$([\s\S]+?)\$\$', _replace_display, text)
+
+    # Replace $...$ inline
+    def _replace_inline(m):
+        return _convert_math(m.group(1))
+
+    text = re.sub(r'\$([^$\n]+?)\$', _replace_inline, text)
+
+    return text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRIP NON-RENDERABLE GLYPHS (emoji etc.) for matplotlib
+# ══════════════════════════════════════════════════════════════════════════════
+def _strip_non_renderable(text: str) -> str:
+    """Remove emoji and glyphs DejaVu Sans cannot render."""
+    result = []
+    for ch in text:
+        cp = ord(ch)
+        cat = unicodedata.category(ch)
+        # Allow standard ASCII + common extended Latin + math symbols
+        if cp < 0x0300:
+            result.append(ch)
+            continue
+        # Keep Greek, math operators, common symbols
+        if 0x0300 <= cp <= 0x03FF:   # Greek / combining
+            result.append(ch)
+        elif 0x2000 <= cp <= 0x23FF: # General punctuation, arrows, math
+            result.append(ch)
+        elif cat.startswith(('L', 'N', 'P', 'Z', 'S')):
+            # Drop Symbol,other (So) above BMP — that's where most emoji live
+            if cat == 'So' and cp > 0x2FFF:
+                continue
+            if cp > 0xFFFF:  # Supplementary planes (emoji, etc.)
+                continue
+            result.append(ch)
+        # else drop
+    return ''.join(result)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LATEX / MATHTEXT SANITISER  (for matplotlib mathtext renderer)
 # ══════════════════════════════════════════════════════════════════════════════
 def _sanitise_mathtext(s: str) -> str:
+    # Strip non-renderable glyphs first
+    s = _strip_non_renderable(s)
+
+    # ── FIX: convert \begin{cases}...\end{cases} to inline fallback ──────────
+    def _cases_to_inline(m):
+        inner = m.group(1)
+        branches = [b.strip() for b in re.split(r'\\\\', inner) if b.strip()]
+        parts = []
+        for b in branches:
+            b = re.sub(r'\s*&\s*', r',\\ ', b).strip()
+            parts.append(b)
+        return r'\{\ ' + r'\ ;\ '.join(parts) + r'\ \}'
+    s = re.sub(
+        r'\\begin\s*\{cases\}([\s\S]*?)\\end\s*\{cases\}',
+        _cases_to_inline, s
+    )
+    # Remove any remaining \begin{...} / \end{...} that mathtext can't handle
+    s = re.sub(r'\\(?:begin|end)\s*\{[^}]*\}', '', s)
+
+    # Unicode → LaTeX command substitutions
     s = s.replace('∞', r'\infty')
     s = s.replace('∑', r'\sum')
     s = s.replace('∫', r'\int')
@@ -357,7 +585,7 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
 
-        title_clean = re.sub(r'[^\x00-\x7F]+', '', title).strip()
+        title_clean = _strip_non_renderable(re.sub(r'[^\x00-\x7F]+', '', title).strip())
         ax.text(0.5, 0.97, title_clean,
                 transform=ax.transAxes,
                 fontsize=FONT + 4, fontweight="bold",
@@ -512,7 +740,7 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
             p_ax.set_facecolor('white'); p_ax.axis('off')
             p_ax.set_xlim(0, 1); p_ax.set_ylim(0, p_h)
             p_y = p_h - 0.15
-            p_ax.text(0.5, p_y, f"{title}  (page {pi})",
+            p_ax.text(0.5, p_y, f"{_strip_non_renderable(title)}  (page {pi})",
                       fontsize=18, fontweight='bold', color='#1a1a2e',
                       ha='center', va='top', usetex=False)
             p_y -= TITLE_H
@@ -526,12 +754,14 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
                         p_ax.text(0.06, p_y, f'${safe}$', fontsize=MATH_FS, color='#003388',
                                   va='top', ha='left', usetex=False)
                     except Exception:
-                        p_ax.text(0.06, p_y, txt, fontsize=MATH_FS - 2, color='#444444',
+                        p_ax.text(0.06, p_y, _strip_non_renderable(txt),
+                                  fontsize=MATH_FS - 2, color='#444444',
                                   va='top', ha='left', fontfamily='monospace', usetex=False)
                     p_y -= MATH_H
                 else:
                     display = re.sub(r'\*\*?([^*]+)\*\*?', r'\1', txt)
                     display = re.sub(r'__?([^_]+)__?', r'\1', display)
+                    display = _strip_non_renderable(display)
                     is_heading = bool(re.match(r'Step\s+\d+', txt.strip()) or
                                       re.match(r'Problem\s+\d+', txt.strip()))
                     wrapped = textwrap.wrap(display, width=WRAP_WIDTH) or [display]
@@ -561,7 +791,8 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
     ax.set_xlim(0, 1); ax.set_ylim(0, total_h)
 
     y = total_h - 0.15
-    ax.text(0.5, y, title, fontsize=18, fontweight='bold', color='#1a1a2e',
+    ax.text(0.5, y, _strip_non_renderable(title),
+            fontsize=18, fontweight='bold', color='#1a1a2e',
             ha='center', va='top', usetex=False)
     y -= TITLE_H
     ax.plot([0.02, 0.98], [y + 0.10, y + 0.10], color='#cccccc', linewidth=1.0)
@@ -576,12 +807,14 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
                 ax.text(MATH_INDENT, y, f'${safe}$', fontsize=MATH_FS, color='#003388',
                         va='top', ha='left', usetex=False)
             except Exception:
-                ax.text(MATH_INDENT, y, txt, fontsize=MATH_FS - 2, color='#444444',
+                ax.text(MATH_INDENT, y, _strip_non_renderable(txt),
+                        fontsize=MATH_FS - 2, color='#444444',
                         va='top', ha='left', fontfamily='monospace', usetex=False)
             y -= MATH_H
         else:
             display = re.sub(r'\*\*?([^*]+)\*\*?', r'\1', txt)
             display = re.sub(r'__?([^_]+)__?', r'\1', display)
+            display = _strip_non_renderable(display)
             is_heading = bool(re.match(r'\*\*', txt) or
                               re.match(r'Step\s+\d+', txt.strip()) or
                               re.match(r'Problem\s+\d+', txt.strip()) or
@@ -612,6 +845,9 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
 async def send_llm_response(update: Update, response_text: str,
                              title: str, msg_id: int,
                              force_image: bool = False) -> None:
+    # Clean boilerplate preamble then convert LaTeX to plain unicode for text mode
+    response_text = _clean_llm_response(response_text)
+
     if force_image or _is_math_title(title):
         png = render_response_png(response_text, title, msg_id)
         if png and os.path.exists(png):
@@ -623,8 +859,10 @@ async def send_llm_response(update: Update, response_text: str,
                 return
             print(f"[send_llm_response] photo failed, falling back to text")
 
-    for i in range(0, len(response_text), 4096):
-        await _safe_reply(update, response_text[i:i + 4096])
+    # Plain-text fallback: convert LaTeX markup to readable unicode
+    plain_text = _latex_to_plain(response_text)
+    for i in range(0, len(plain_text), 4096):
+        await _safe_reply(update, plain_text[i:i + 4096])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LAPLACE STEP BUILDER
@@ -675,7 +913,7 @@ def _build_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         steps.append(("Result", rf"F(s) = {_sympy_to_latex(result)}"))
         return steps, ""
     except Exception as e:
-        return [], f"❌ Could not compute Laplace transform: {e}"
+        return [], f"Could not compute Laplace transform: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INVERSE LAPLACE STEP BUILDER
@@ -729,16 +967,16 @@ def _build_inv_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]
         return steps, ""
 
     except Exception as e:
-        return [], f"❌ Could not compute Inverse Laplace transform: {e}"
+        return [], f"Could not compute Inverse Laplace transform: {e}"
 
 def compute_inv_laplace(expr_str: str) -> str:
-    lines = ["━━━ 📐 INVERSE LAPLACE TRANSFORM ━━━\n"]
+    lines = ["--- INVERSE LAPLACE TRANSFORM ---\n"]
     lines.append(f"Input:  F(s) = {expr_str}\n")
-    lines.append(r"Definition:  f(t) = (1/2πj) ∫ F(s)·e^(st) ds" + "\n")
+    lines.append("Definition:  f(t) = (1/2πj) ∫ F(s)·e^(st) ds" + "\n")
     try:
         F = sp.sympify(_normalise(expr_str), locals={**_COMMON_NS, "s": s_sym})
     except Exception as e:
-        return f"❌ Could not parse expression: {e}"
+        return f"Could not parse expression: {e}"
     try:
         pf = sp.apart(F, s_sym)
         if pf != F:
@@ -749,9 +987,9 @@ def compute_inv_laplace(expr_str: str) -> str:
         result = sp.inverse_laplace_transform(F, s_sym, t_sym)
         result = sp.simplify(result)
         lines.append(f"Result:\n   f(t) = {sp.pretty(result)}\n")
-        lines.append(f"\n✅  f(t) = {sp.pretty(result)}")
+        lines.append(f"\nf(t) = {sp.pretty(result)}")
     except Exception as e:
-        lines.append(f"❌ SymPy could not find a closed form: {e}")
+        lines.append(f"SymPy could not find a closed form: {e}")
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -820,7 +1058,7 @@ def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         steps.append(("Result", rf"F(\omega) = {result_tex}"))
         return steps, ""
     except Exception as e:
-        return [], f"❌ Could not compute Fourier transform: {e}"
+        return [], f"Could not compute Fourier transform: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INVERSE FOURIER STEP BUILDER
@@ -875,16 +1113,16 @@ def _build_inv_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]
         return steps, ""
 
     except Exception as e:
-        return [], f"❌ Could not compute Inverse Fourier transform: {e}"
+        return [], f"Could not compute Inverse Fourier transform: {e}"
 
 def compute_inv_fourier(expr_str: str) -> str:
-    lines = ["━━━ 📡 INVERSE FOURIER TRANSFORM ━━━\n"]
+    lines = ["--- INVERSE FOURIER TRANSFORM ---\n"]
     lines.append(f"Input:  F(ω) = {expr_str}\n")
     lines.append("Definition:  f(t) = (1/2π) ∫ F(ω)·e^(jωt) dω\n")
     try:
         F = sp.sympify(_normalise(expr_str), locals={**_COMMON_NS, "omega": w_sym})
     except Exception as e:
-        return f"❌ Could not parse expression: {e}"
+        return f"Could not parse expression: {e}"
     try:
         result = sp.integrate(
             F * sp.exp(sp.I * w_sym * t_sym) / (2 * sp.pi),
@@ -893,11 +1131,11 @@ def compute_inv_fourier(expr_str: str) -> str:
         if not result.has(sp.Integral):
             result = sp.simplify(result)
             lines.append(f"Result:\n   f(t) = {sp.pretty(result)}\n")
-            lines.append(f"\n✅  f(t) = {sp.pretty(result)}")
+            lines.append(f"\nf(t) = {sp.pretty(result)}")
         else:
-            lines.append("❌ Integral could not be evaluated in closed form.")
+            lines.append("Integral could not be evaluated in closed form.")
     except Exception as e:
-        lines.append(f"❌ Could not evaluate: {e}")
+        lines.append(f"Could not evaluate: {e}")
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -941,7 +1179,7 @@ def _build_periodic_fourier_steps(g_expr_str: str, period: float = 2.0
                        rf"G(n\omega_0)\,\delta(\omega-n\omega_0)"))
         return steps, ""
     except Exception as e:
-        return [], f"❌ Could not compute periodic Fourier transform: {e}"
+        return [], f"Could not compute periodic Fourier transform: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FOURIER SERIES STEP BUILDER
@@ -985,15 +1223,15 @@ def _build_fourier_series_steps(expr_str: str, period: float,
 
         return steps, ""
     except Exception as e:
-        return [], f"❌ Could not compute Fourier series: {e}"
+        return [], f"Could not compute Fourier series: {e}"
 
 def compute_fourier_series(expr_str: str, period: float, n_terms: int = 5) -> str:
-    lines = ["━━━ 🎵 FOURIER SERIES ━━━\n"]
+    lines = ["--- FOURIER SERIES ---\n"]
     lines.append(f"Input: f(t) = {expr_str},  T = {period:.4g}\n")
     try:
         f = parse_ct_expr(expr_str)
     except Exception as e:
-        return f"❌ Could not parse expression: {e}"
+        return f"Could not parse expression: {e}"
     T  = sp.Rational(period).limit_denominator(1000)
     w0 = 2 * sp.pi / T
     try:
@@ -1005,32 +1243,32 @@ def compute_fourier_series(expr_str: str, period: float, n_terms: int = 5) -> st
         series = sp.fourier_series(f, (t_sym, 0, T))
         trunc  = series.truncate(n_terms)
         lines.append(f"\nf(t) ≈ {sp.pretty(trunc)}")
-        lines.append("\n✅  Series computed successfully.")
+        lines.append("\nSeries computed successfully.")
     except Exception as e:
-        lines.append(f"\n⚠️  {e}")
+        lines.append(f"\n{e}")
     return "\n".join(lines)
 
 def compute_fourier(expr_str: str) -> str:
-    lines = ["━━━ 📡 FOURIER TRANSFORM ━━━\n"]
+    lines = ["--- FOURIER TRANSFORM ---\n"]
     lines.append(f"Input:  f(t) = {expr_str}\n")
     try:
         f = parse_ct_expr(expr_str)
         result = _fourier_direct(f)
-        lines.append(f"✅  F(ω) = {sp.pretty(result)}")
+        lines.append(f"F(ω) = {sp.pretty(result)}")
     except Exception as e:
-        lines.append(f"❌ {e}")
+        lines.append(f"{e}")
     return "\n".join(lines)
 
 def compute_laplace(expr_str: str) -> str:
-    lines = ["━━━ 📐 LAPLACE TRANSFORM ━━━\n"]
+    lines = ["--- LAPLACE TRANSFORM ---\n"]
     lines.append(f"Input:  f(t) = {expr_str}\n")
     try:
         f      = parse_ct_expr(expr_str)
         result = sp.laplace_transform(f, t_sym, s_sym, noconds=True)
         result = sp.simplify(result)
-        lines.append(f"✅  F(s) = {sp.pretty(result)}")
+        lines.append(f"F(s) = {sp.pretty(result)}")
     except Exception as e:
-        lines.append(f"❌ {e}")
+        lines.append(f"{e}")
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1086,7 +1324,7 @@ def _numerical_convolution_plot(f_expr: sp.Expr, g_expr: sp.Expr, msg_id: int) -
         axes[1].plot(t_vals, g_vals, color="darkorange")
         axes[1].set(title="g(t)", xlabel="t"); axes[1].grid(True, alpha=.3)
         axes[2].plot(t_full[mask], conv[mask], color="green")
-        axes[2].set(title="(f ★ g)(t)  [numerical]", xlabel="t")
+        axes[2].set(title="(f * g)(t)  [numerical]", xlabel="t")
         axes[2].grid(True, alpha=.3)
         fig.tight_layout()
         path = os.path.join(PLOT_FOLDER, f"conv_{msg_id}.png")
@@ -1104,7 +1342,7 @@ def _build_convolution_steps(expr1_str: str, expr2_str: str,
         f = parse_ct_expr(expr1_str)
         g = parse_ct_expr(expr2_str)
     except Exception as e:
-        return [], f"❌ Could not parse signals: {e}", None
+        return [], f"Could not parse signals: {e}", None
 
     steps.append(("f(t)",       _sympy_to_latex(f)))
     steps.append(("g(t)",       _sympy_to_latex(g)))
@@ -1148,13 +1386,13 @@ def _parse_two_signals(text: str):
     return None, None
 
 def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
-    lines = ["━━━ 🔁 CONVOLUTION ━━━\n"]
+    lines = ["--- CONVOLUTION ---\n"]
     lines.append(f"f(t) = {expr1_str}\ng(t) = {expr2_str}\n")
     try:
         f = parse_ct_expr(expr1_str)
         g = parse_ct_expr(expr2_str)
     except Exception as e:
-        return f"❌ {e}", None
+        return f"{e}", None
     f_tau     = f.subs(t_sym, tau)
     g_shift   = g.subs(t_sym, t_sym - tau)
     integrand = sp.expand(f_tau * g_shift)
@@ -1167,10 +1405,10 @@ def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
         result = _simplify_heaviside_powers(result)
         if result.has(sp.Integral):
             raise ValueError("unevaluated")
-        lines.append(f"✅  (f ★ g)(t) = {sp.pretty(result)}")
+        lines.append(f"(f * g)(t) = {sp.pretty(result)}")
         plot_path = _numerical_convolution_plot(f, g, msg_id)
     except Exception as e:
-        lines.append(f"❌ Symbolic failed: {e}")
+        lines.append(f"Symbolic failed: {e}")
         plot_path = _numerical_convolution_plot(f, g, msg_id)
     return "\n".join(lines), plot_path
 
@@ -1229,8 +1467,8 @@ def plot_dirac_arrow(t0: float, msg_id: int) -> str:
     ax.annotate("", xy=(t0, 1), xytext=(t0, 0),
                 arrowprops=dict(arrowstyle="-|>", color="steelblue", lw=2.5))
     ax.set_xlim(t0 - 3, t0 + 3); ax.set_ylim(-0.2, 1.5)
-    label = f"δ(t − {t0})" if t0 != 0 else "δ(t)"
-    ax.set(title=label, xlabel="t", ylabel="δ(t)"); ax.grid(True, alpha=.4)
+    label = f"delta(t - {t0})" if t0 != 0 else "delta(t)"
+    ax.set(title=label, xlabel="t", ylabel="delta(t)"); ax.grid(True, alpha=.4)
     fig.tight_layout()
     path = os.path.join(PLOT_FOLDER, f"plot_{msg_id}.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -1313,14 +1551,14 @@ def compute_result(data: dict) -> str:
         f"  *(Exam carries the remaining 60%)*\n",
     ]
     if req_exam <= 0:
-        lines.append("✅ You've already secured enough to pass!")
+        lines.append("You've already secured enough to pass!")
     elif req_exam > 100:
-        lines.append(f"❌ You'd need {req_exam:.1f}% — mathematically impossible. Give it your best!")
+        lines.append(f"You'd need {req_exam:.1f}% — mathematically impossible. Give it your best!")
     else:
-        lines.append(f"🎯 *You need at least {req_exam:.1f}% in the exam to pass.*")
-        if req_exam <= 50:   lines.append("💪 Very achievable — keep it up!")
-        elif req_exam <= 70: lines.append("📚 Tough but doable with a solid plan!")
-        else:                lines.append("⚠️ Hard work required — start now!")
+        lines.append(f"*You need at least {req_exam:.1f}% in the exam to pass.*")
+        if req_exam <= 50:   lines.append("Very achievable — keep it up!")
+        elif req_exam <= 70: lines.append("Tough but doable with a solid plan!")
+        else:                lines.append("Hard work required — start now!")
     return "\n".join(lines)
 
 async def handle_mark_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1337,14 +1575,14 @@ async def handle_mark_session(update: Update, context: ContextTypes.DEFAULT_TYPE
         step    = session["step"]
         if text.lower() in ["cancel", "stop", "quit", "exit"]:
             del mark_sessions[chat_id]
-            await _safe_reply(update, "❌ Cancelled.")
+            await _safe_reply(update, "Cancelled.")
             return True
         try:
             value = float(text)
             if not 0 <= value <= 100:
                 raise ValueError
         except ValueError:
-            await _safe_reply(update, "⚠️ Enter a number 0–100, or type *cancel*.",
+            await _safe_reply(update, "Please enter a number 0–100, or type *cancel*.",
                               parse_mode="Markdown")
             return True
         session["data"][step] = value
@@ -1365,9 +1603,9 @@ async def handle_mark_session(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ══════════════════════════════════════════════════════════════════════════════
 def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
     if not image_bytes or len(image_bytes) < 100:
-        return f"❌ OCR failed: image too small ({len(image_bytes)} bytes)"
+        return f"OCR failed: image too small ({len(image_bytes)} bytes)"
     if not GEMINI_API_KEY:
-        return "❌ OCR failed: GEMINI_API_KEY not set."
+        return "OCR failed: GEMINI_API_KEY not set."
     mime = mime.lower().lstrip(".")
     if mime == "jpg": mime = "jpeg"
     if mime not in ("jpeg", "png", "webp", "gif"): mime = "jpeg"
@@ -1395,7 +1633,7 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
         content = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
         return content
     except Exception as e:
-        return f"❌ OCR request failed: {e}"
+        return f"OCR request failed: {e}"
 
 def _extract_pdf_bytes(pdf_bytes: bytes) -> str:
     import io
@@ -1495,9 +1733,16 @@ def auto_route_extracted_text(extracted: str) -> str | None:
 # SESSION-AWARE LLM PROMPTS
 # ══════════════════════════════════════════════════════════════════════════════
 _LATEX_INSTRUCTION = (
-    "FORMATTING RULE: Wrap ALL math in $...$ or $$...$$ LaTeX. "
-    "Use \\frac{}{}, \\int, \\sum, \\omega, \\delta, \\pi, \\mathcal{L}, \\mathcal{F}. "
-    "Always space LaTeX commands from following letters: $\\pi G$ not $\\piG$."
+    "FORMATTING RULE: Do NOT use LaTeX dollar-sign notation ($...$) anywhere in your response. "
+    "Instead, write all mathematics in plain text using Unicode symbols directly:\n"
+    "  - Use ω for omega, π for pi, δ for delta, τ for tau, α β γ θ φ λ σ μ for other Greek letters\n"
+    "  - Use ∞ for infinity, ∑ for sum, ∫ for integral, → for arrow\n"
+    "  - Use ^ for powers (e.g. e^(-st)), / for fractions (e.g. 1/(s+2))\n"
+    "  - Write subscripts inline: omega_0, X_n, a_k\n"
+    "  - Write fractions as num/den (e.g. ω/(s²+ω²))\n"
+    "  - Use × for multiply where helpful, · for dot product\n"
+    "  - Write equations on their own line for clarity\n"
+    "Example: write   F(s) = 1/(s+2)   not   $F(s) = \\frac{1}{s+2}$"
 )
 
 _SESSION_RULES = (
@@ -1505,11 +1750,14 @@ _SESSION_RULES = (
     "1. The uploaded document is the PRIMARY source of truth.\n"
     "2. Use general knowledge only to explain/clarify — never to override the doc.\n"
     "3. If OCR looks garbled, say so and give your best interpretation.\n"
-    f"4. {_LATEX_INSTRUCTION}"
+    f"4. {_LATEX_INSTRUCTION}\n"
+    "5. Start your response DIRECTLY with the content. "
+    "Do NOT begin with phrases like 'I'll be happy to help', 'Sure!', "
+    "'Certainly!', 'Classification:', 'Question:', or 'Answer:'. "
+    "Go straight to the explanation or solution."
 )
 
 
-# ── CHANGE 2: improved _prompt_explain_memo ───────────────────────────────────
 def _prompt_explain_memo(doc_text: str, instruction: str) -> str:
     return (
         f"{_SESSION_RULES}\n\n"
@@ -1527,12 +1775,10 @@ def _prompt_explain_memo(doc_text: str, instruction: str) -> str:
         f"the worked solution.\n"
         f"5. End with one short study tip specific to this technique.\n"
         f"Be concise but thorough. Use numbered steps. "
-        f"Wrap all math in $...$ or $$...$$. "
-        f"Always write summation limits as $$\\sum_{{k=-\\infty}}^{{\\infty}}$$ in LaTeX."
+        f"Write all math in plain text / Unicode — NO LaTeX dollar signs."
     )
 
 
-# ── CHANGE 3: improved _prompt_mark ──────────────────────────────────────────
 def _prompt_mark(memo_text: str, student_work: str) -> str:
     return (
         f"{_SESSION_RULES}\n\n"
@@ -1542,18 +1788,15 @@ def _prompt_mark(memo_text: str, student_work: str) -> str:
         f"1. OVERALL VERDICT: State one of CORRECT / PARTIALLY CORRECT / INCORRECT.\n"
         f"2. MARKS: Estimate marks earned out of the total available "
         f"(use the memo's mark allocation if visible, otherwise use your judgement).\n"
-        f"3. WHAT IS CORRECT: List every step or element the student got right. "
-        f"Acknowledge partial credit where the approach is sound but execution is flawed.\n"
+        f"3. WHAT IS CORRECT: List every step or element the student got right.\n"
         f"4. ERRORS: For each mistake, state:\n"
         f"   a) What the student wrote\n"
         f"   b) What it should be\n"
         f"   c) The concept they missed\n"
-        f"5. IMPROVEMENT: Give a concise explanation of how to correct each error, "
-        f"referencing the memo solution.\n"
-        f"6. ENCOURAGEMENT: End with one specific, genuine encouragement statement "
-        f"based on what the student demonstrated.\n"
+        f"5. IMPROVEMENT: Concise explanation of how to correct each error.\n"
+        f"6. ENCOURAGEMENT: End with one specific, genuine encouragement statement.\n"
         f"Format each section clearly with its heading. "
-        f"Wrap all math in $...$ or $$...$$."
+        f"Write all math in plain text / Unicode — NO LaTeX dollar signs."
     )
 
 
@@ -1561,16 +1804,16 @@ def _prompt_solve(doc_text: str, instruction: str) -> str:
     return (f"{_SESSION_RULES}\n\nDocument:\n\"\"\"\n{doc_text}\n\"\"\"\n\n"
             f"Student instruction: {instruction}\n\n"
             f"Respond directly. Numbered steps for math. Explain every formula. "
-            f"Wrap all math in $...$ or $$...$$.")
+            f"Write all math in plain text / Unicode — NO LaTeX dollar signs.")
 
 def _prompt_explain(doc_text: str, question: str) -> str:
     return (f"{_SESSION_RULES}\n\nDocument:\n\"\"\"\n{doc_text}\n\"\"\"\n\n"
             f"Student question: {question}\n\n"
-            f"FACTUAL → 2-4 sentences. CONCEPTUAL → paragraph + example. "
-            f"CALCULATION → numbered steps. Wrap all math in $...$ or $$...$$.")
+            f"FACTUAL: 2-4 sentences. CONCEPTUAL: paragraph + example. "
+            f"CALCULATION: numbered steps. "
+            f"Write all math in plain text / Unicode — NO LaTeX dollar signs.")
 
 
-# ── CHANGE 1: _call_llm with retry logic ─────────────────────────────────────
 def _call_llm(prompt: str, max_tokens: int = 1800) -> str:
     payload = {
         "model": LLM_MODEL,
@@ -1596,12 +1839,11 @@ def _call_llm(prompt: str, max_tokens: int = 1800) -> str:
             time.sleep(5)
         except Exception as e:
             if attempt == 2:
-                return f"❌ LLM call failed after 3 attempts: {e}"
+                return f"LLM call failed after 3 attempts: {e}"
             time.sleep(5)
-    return "❌ Together AI is temporarily unavailable. Please try again in a minute."
+    return "Together AI is temporarily unavailable. Please try again in a minute."
 
 
-# ── CHANGE 4: _route_session_prompt with more keywords ───────────────────────
 def _route_session_prompt(doc_text: str, instruction: str) -> str:
     instr_lower = instruction.lower()
     if any(kw in instr_lower for kw in [
@@ -1634,7 +1876,7 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
     if os.path.exists(chroma_dir) and os.listdir(chroma_dir):
-        print("✅ Loading existing ChromaDB…")
+        print("Loading existing ChromaDB…")
         try:
             client = chromadb.PersistentClient(
                 path=chroma_dir, settings=Settings(anonymized_telemetry=False))
@@ -1647,10 +1889,10 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
         except Exception as e:
             print(f"   Load failed: {e} — rebuilding…")
 
-    print("📄 Building ChromaDB from PDFs…")
+    print("Building ChromaDB from PDFs…")
     pdf_files = [f for f in os.listdir(pdf_folder) if f.endswith(".pdf")]
     if not pdf_files:
-        print("⚠️  No PDFs found.")
+        print("No PDFs found.")
         return None
     loader   = PyPDFDirectoryLoader(pdf_folder)
     docs     = loader.load()
@@ -1663,7 +1905,7 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
     client = chromadb.PersistentClient(
         path=chroma_dir, settings=Settings(anonymized_telemetry=False))
     vs = Chroma.from_documents(chunks, embedding=embeddings, client=client)
-    print(f"   ✅ {vs._collection.count()} vectors saved")
+    print(f"   {vs._collection.count()} vectors saved")
     return vs
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1671,11 +1913,14 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
 # ══════════════════════════════════════════════════════════════════════════════
 TUTOR_PROMPT = PromptTemplate.from_template(
     "You are a Signals and Systems tutor assistant.\n\n"
-    "FORMATTING RULE: Wrap ALL math in $...$ or $$...$$ LaTeX. "
-    "Use \\frac{{}}{{}}, \\int, \\sum, \\omega, \\delta, \\pi, "
-    "\\mathcal{{L}}, \\mathcal{{F}}, e^{{-st}}. "
-    "Always space commands from letters: $\\pi G$ not $\\piG$.\n\n"
-    "Classify the question (silently):\n"
+    "FORMATTING RULE: Do NOT use LaTeX dollar-sign notation ($...$) anywhere. "
+    "Write all mathematics in plain text using Unicode symbols directly: "
+    "ω for omega, π for pi, δ for delta, ∞ for infinity, ∑ for sum, ∫ for integral. "
+    "Use ^ for powers, / for fractions. Write equations on their own line.\n\n"
+    "Start your response DIRECTLY with the answer. "
+    "Do NOT begin with 'I'll be happy to help', 'Sure!', 'Classification:', "
+    "'Question:', 'Answer:', or any preamble.\n\n"
+    "Classify the question type internally (do not state the classification):\n"
     "  A) FACTUAL → 2-4 sentences.\n"
     "  B) CONCEPTUAL → short paragraph + one example.\n"
     "  C) CALCULATION → numbered steps, explain every symbol.\n\n"
@@ -1697,9 +1942,9 @@ vector_store = build_vector_store_if_needed(PDF_FOLDER, CHROMA_DIR)
 qa_chain     = None
 if vector_store:
     qa_chain = build_chains(vector_store)
-    print("✅ RAG chain ready")
+    print("RAG chain ready")
 else:
-    print("⚠️  Running without knowledge base.")
+    print("Running without knowledge base.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TELEGRAM UTILITY
@@ -1804,12 +2049,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 3. Math tools ─────────────────────────────────────────────────────────
 
-    # ── Inverse Laplace ───────────────────────────────────────────────────────
     if is_inv_laplace(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
             await _safe_reply(update,
-                "⚠️ Please include an expression, e.g.:\n"
+                "Please include an expression, e.g.:\n"
                 "  _inverse laplace of 1/(s+2)_\n"
                 "  _ilt of s/(s^2+4)_", parse_mode="Markdown")
             return
@@ -1828,12 +2072,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_long_code(update, compute_inv_laplace(expr_str))
         return
 
-    # ── Inverse Fourier ───────────────────────────────────────────────────────
     if is_inv_fourier(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
             await _safe_reply(update,
-                "⚠️ Please include an expression, e.g.:\n"
+                "Please include an expression, e.g.:\n"
                 "  _inverse fourier of 1/(1+j*omega)_\n"
                 "  _ift of 2*pi*DiracDelta(omega)_", parse_mode="Markdown")
             return
@@ -1852,7 +2095,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_long_code(update, compute_inv_fourier(expr_str))
         return
 
-    # ── Periodic summation Fourier ────────────────────────────────────────────
     if is_periodic_fourier(q_lower):
         period_val = _extract_period(question) or 2.0
         g_str = None
@@ -1860,7 +2102,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         g_str = g_def_q.group(1).strip() if g_def_q else None
         if not g_str:
             await _safe_reply(update,
-                "⚠️ Please tell me what *g(t)* is, e.g.:\n"
+                "Please tell me what *g(t)* is, e.g.:\n"
                 "  _fourier transform of x(t) = sum g(t-2k), g(t) = e^(-t)*u(t), T=2_",
                 parse_mode="Markdown")
             return
@@ -1873,15 +2115,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             png = _render_math_png("Fourier Transform  (Periodic Summation)", steps, msg_id)
             if png and os.path.exists(png):
                 await _safe_reply_photo(update, png,
-                    f"Periodic Fourier: x(t)=Σg(t−{period_val}k), g(t)={g_str}, T={period_val}")
+                    f"Periodic Fourier: x(t)=sum g(t-{period_val}k), g(t)={g_str}, T={period_val}")
         return
 
-    # ── Laplace ───────────────────────────────────────────────────────────────
     if is_laplace(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
             await _safe_reply(update,
-                "⚠️ Please include an expression, e.g.:\n"
+                "Please include an expression, e.g.:\n"
                 "  _laplace of e^(-2*t)*u(t)_", parse_mode="Markdown")
             return
         await _safe_reply(update, "⏳ Computing Laplace transform…")
@@ -1899,12 +2140,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_long_code(update, compute_laplace(expr_str))
         return
 
-    # ── Fourier Transform ─────────────────────────────────────────────────────
     if is_fourier(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
             await _safe_reply(update,
-                "⚠️ Please include an expression, e.g.:\n"
+                "Please include an expression, e.g.:\n"
                 "  _fourier transform of e^(-t)*u(t)_", parse_mode="Markdown")
             return
         await _safe_reply(update, "⏳ Computing Fourier transform…")
@@ -1922,12 +2162,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_long_code(update, compute_fourier(expr_str))
         return
 
-    # ── Fourier Series ────────────────────────────────────────────────────────
     if is_fs(q_lower):
         period = _extract_period(question)
         if not period:
             await _safe_reply(update,
-                "⚠️ Please include the period, e.g.:\n"
+                "Please include the period, e.g.:\n"
                 "  _fourier series of t, T=2_", parse_mode="Markdown")
             return
         expr_str = extract_expr(question)
@@ -1950,12 +2189,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_long_code(update, compute_fourier_series(expr_str, period))
         return
 
-    # ── Convolution ───────────────────────────────────────────────────────────
     if is_conv(q_lower):
         e1, e2 = _parse_two_signals(question)
         if not (e1 and e2):
             await _safe_reply(update,
-                "⚠️ Please specify both signals, e.g.:\n"
+                "Please specify both signals, e.g.:\n"
                 "  _convolve e^(-t)*u(t) with u(t)_", parse_mode="Markdown")
             return
         await _safe_reply(update,
@@ -1964,10 +2202,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if err:
             await _safe_reply(update, err)
         else:
-            png = _render_math_png("Convolution  (f ★ g)(t)", steps, msg_id)
+            png = _render_math_png("Convolution  (f * g)(t)", steps, msg_id)
             if png and os.path.exists(png):
                 success = await _safe_reply_photo(
-                    update, png, f"Convolution: f(t)={e1} ★ g(t)={e2}")
+                    update, png, f"Convolution: f(t)={e1} * g(t)={e2}")
                 if not success:
                     text_result, _ = compute_convolution(e1, e2, msg_id)
                     await send_long_code(update, text_result)
@@ -1977,10 +2215,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 plot_path = plot_path or plot_path2
             if plot_path and os.path.exists(plot_path):
                 await _safe_reply_photo(update, plot_path,
-                                        "📊 Numerical convolution (f ★ g)(t)")
+                                        "Numerical convolution (f * g)(t)")
         return
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
     if is_plot(q_lower):
         await _safe_reply(update, "📊 Generating plot…")
         fig_path = generate_plot(question, msg_id)
@@ -1988,24 +2225,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success = await _safe_reply_photo(update, fig_path, f"📈 {question}")
             if not success:
                 await _safe_reply(update,
-                    "⚠️ Plot generated but could not be sent. Please try again.")
+                    "Plot generated but could not be sent. Please try again.")
         else:
             await _safe_reply(update,
-                "⚠️ Could not parse that expression.\n"
+                "Could not parse that expression.\n"
                 "Examples: _plot 2*u(t-2)_  /  _draw u[n]-u[n-3]_",
                 parse_mode="Markdown")
         return
 
     # ── 4. General tutor Q&A via RAG ──────────────────────────────────────────
     if not qa_chain:
-        await _safe_reply(update, "⚠️ No knowledge base loaded.")
+        await _safe_reply(update, "No knowledge base loaded.")
         return
     await _safe_reply(update, "🤔 Thinking…")
     try:
         answer = qa_chain.invoke(question)
+        answer = _clean_llm_response(answer)
+        answer = _latex_to_plain(answer)
         await send_llm_response(update, answer, "Tutor Answer", msg_id)
     except Exception as e:
-        await _safe_reply(update, f"❌ Something went wrong: {str(e)}")
+        await _safe_reply(update, f"Something went wrong: {str(e)}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHOTO HANDLER
@@ -2025,7 +2264,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_bytes = buf.getvalue()
 
     extracted = _ocr_image_bytes(image_bytes, "jpeg")
-    await _safe_reply(update, f"📝 Extracted:\n\n{extracted}")
+    await _safe_reply(update, f"Extracted:\n\n{extracted}")
 
     sess = session_get(chat_id)
 
@@ -2036,6 +2275,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ Marking against *{sess['source']}*…", parse_mode="Markdown")
             prompt   = _prompt_mark(sess["text"], extracted)
             response = _call_llm(prompt)
+            response = _clean_llm_response(response)
+            response = _latex_to_plain(response)
             await send_llm_response(update, response,
                                     f"Marking Feedback — {sess['source']}", msg_id)
             session_clear(chat_id)
@@ -2049,6 +2290,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
             prompt   = _route_session_prompt(doc_text, caption)
             response = _call_llm(prompt)
+            response = _clean_llm_response(response)
+            response = _latex_to_plain(response)
             await send_llm_response(update, response, f"Answer — {source}", msg_id)
             if sess:
                 session_clear(chat_id)
@@ -2057,7 +2300,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         routed_command = auto_route_extracted_text(extracted)
         if routed_command:
             await _safe_reply(update,
-                f"🔍 Detected: `{routed_command[:120]}`\nSolving…",
+                f"Detected: `{routed_command[:120]}`\nSolving…",
                 parse_mode="Markdown")
             q_lower = routed_command.lower()
 
@@ -2120,10 +2363,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if not err:
                         png = _render_math_png("Convolution", steps, msg_id)
                         if png and os.path.exists(png):
-                            await _safe_reply_photo(update, png, f"{e1} ★ {e2}")
+                            await _safe_reply_photo(update, png, f"{e1} * {e2}")
                         if plot_path and os.path.exists(plot_path):
                             await _safe_reply_photo(update, plot_path,
-                                                     "📊 Numerical convolution")
+                                                     "Numerical convolution")
                         return
 
             elif is_plot(q_lower):
@@ -2136,12 +2379,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _safe_reply(update, "🤔 Solving with tutor…")
                 try:
                     answer = qa_chain.invoke(extracted)
+                    answer = _clean_llm_response(answer)
+                    answer = _latex_to_plain(answer)
                     await send_llm_response(update, answer, "Tutor Answer", msg_id)
                 except Exception as e:
-                    await _safe_reply(update, f"❌ {str(e)}")
+                    await _safe_reply(update, f"{str(e)}")
             else:
                 await _safe_reply(update,
-                    "⚠️ No knowledge base loaded. Add a caption with your question.")
+                    "No knowledge base loaded. Add a caption with your question.")
         else:
             if sess:
                 context.user_data["pending_student_work"] = extracted
@@ -2171,7 +2416,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
     if extension not in {".pdf"} | SUPPORTED_IMAGES:
         await _safe_reply(update,
-            "⚠️ Unsupported file type. Please send a PDF or image (PNG, JPG, WEBP).")
+            "Unsupported file type. Please send a PDF or image (PNG, JPG, WEBP).")
         return
 
     await _safe_reply(update,
@@ -2198,10 +2443,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session_store(chat_id, extracted, source)
 
-    # ── CHANGE 5: show content preview ───────────────────────────────────────
     preview = extracted[:300].replace("\n", " ")
     await _safe_reply(update,
-        f"✅ Content loaded from *{source}*.\n\n"
+        f"Content loaded from *{source}*.\n\n"
         f"Preview: _{preview}…_\n\n"
         "Now tell me what you'd like:\n"
         "  - Explain how Question 1(b) was solved\n"
@@ -2217,6 +2461,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         prompt   = _route_session_prompt(sess["text"], caption)
         response = _call_llm(prompt)
+        response = _clean_llm_response(response)
+        response = _latex_to_plain(response)
         await send_llm_response(update, response, f"Answer — {source}",
                                 msg_id=update.message.message_id)
         session_clear(chat_id)
@@ -2255,7 +2501,7 @@ async def main():
     app.add_handler(MessageHandler(filters.PHOTO,        handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    print("✅ Bot is running!")
+    print("Bot is running!")
     await app.run_polling(drop_pending_updates=True)
 
 
