@@ -1727,6 +1727,8 @@ def _prompt_explain(doc_text: str, question: str) -> str:
     )
 
 
+import time
+
 def _call_llm(prompt: str, max_tokens: int = 1800) -> str:
     payload = {
         "model": LLM_MODEL,
@@ -1737,13 +1739,30 @@ def _call_llm(prompt: str, max_tokens: int = 1800) -> str:
         "Authorization": f"Bearer {TOGETHER_API_KEY}",
         "Content-Type":  "application/json",
     }
-    try:
-        resp = requests.post(
-            TOGETHER_ENDPOINT, json=payload, headers=headers, timeout=90)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return f"❌ LLM call failed: {e}"
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                TOGETHER_ENDPOINT, json=payload, headers=headers, timeout=90)
+            
+            # Retry on 503 (server down) or 429 (rate limited)
+            if resp.status_code in (503, 429):
+                wait = 5 * (attempt + 1)
+                print(f"[_call_llm] HTTP {resp.status_code} — retrying in {wait}s…")
+                time.sleep(wait)
+                continue
+            
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        
+        except requests.exceptions.Timeout:
+            print(f"[_call_llm] Timeout on attempt {attempt + 1}")
+            time.sleep(5)
+        except Exception as e:
+            if attempt == 2:
+                return f"❌ LLM call failed after 3 attempts: {e}"
+            time.sleep(5)
+    
+    return "❌ Together AI is temporarily unavailable. Please try again in a minute."
 
 
 def _route_session_prompt(doc_text: str, instruction: str) -> str:
