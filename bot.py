@@ -2346,13 +2346,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await _safe_reply(update, f"{str(e)}")
             else:
                 await _safe_reply(update,
-                    "No knowledge base loaded. Add a caption with your question.")
+                    "No knowledge base loaded.")
         else:
             if sess:
                 context.user_data["pending_student_work"] = extracted
                 await _safe_reply(update,
                     f"I have *{sess['source']}* loaded.\n\n"
-                    "Reply *mark* to compare, or tell me what you'd like.",
+                    "Tell me what you'd like.",
                     parse_mode="Markdown")
             else:
                 session_store(chat_id, extracted, "Handwritten photo / diagram")
@@ -2376,7 +2376,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
     if extension not in {".pdf"} | SUPPORTED_IMAGES:
         await _safe_reply(update,
-            "Unsupported file type. Please send a PDF or image (PNG, JPG, WEBP).")
+            "Unsupported file type. Please send a PDF or image (PNG, JPG, PDF).")
         return
 
     await _safe_reply(update,
@@ -2406,12 +2406,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preview = extracted[:300].replace("\n", " ")
     await _safe_reply(update,
         f"Content loaded from *{source}*.\n\n"
-        f"Preview: _{preview}…_\n\n"
         "Now tell me what you'd like:\n"
-        "  - Explain how Question 1(b) was solved\n"
+        "  - Explain how Question 1 was solved\n"
         "  - Answer Question 2(a)\n"
-        "  - Give me two practice problems like Question 3\n"
-        "  - Mark my work against this memo",
+        "  - Verify if your work is correct",
         parse_mode="Markdown")
 
     if caption:
