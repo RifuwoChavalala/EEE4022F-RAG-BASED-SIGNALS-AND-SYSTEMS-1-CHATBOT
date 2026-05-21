@@ -140,6 +140,8 @@ def _normalise(expr: str) -> str:
     s = expr.strip()
     s = s.replace("^", "**").replace("{", "(").replace("}", ")")
     s = re.sub(r'\brect\s*\(',                      'rect(',          s)
+    # ── FIX 3: insert * between digit and u( before mapping u(t) → Heaviside ─
+    s = re.sub(r'(\d)(u\s*[\(\[])',                  r'\1*\2',         s)
     s = re.sub(r'\bu\s*\(\s*t\s*\)',                'Heaviside(t)',   s)
     s = re.sub(r'\bu\s*\(\s*t\s*([+-][^)]+)\)',     r'Heaviside(t\1)', s)
     s = re.sub(r'\bE\*\*(-[^\s\*\+\-\(\),]+)',      r'E**(\1)',       s)
@@ -266,7 +268,6 @@ def _is_math_title(title: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 # LLM RESPONSE CLEANER
 # ══════════════════════════════════════════════════════════════════════════════
-# Patterns the LLM emits that should be stripped before display
 _LLM_PREAMBLE_RE = re.compile(
     r"(?:"
     r"I(?:'ll|'d| will| would)[\s\S]{0,80}?(?:help|assist|answer)[\s\S]{0,120}?\n+"
@@ -279,12 +280,6 @@ _LLM_PREAMBLE_RE = re.compile(
 )
 
 def _clean_llm_response(text: str) -> str:
-    """
-    Remove boilerplate preambles the LLM prepends, e.g.:
-      "I'll be happy to help … **Classification:** C) … **Question:** … **Answer:**"
-    Also strip leading/trailing blank lines.
-    """
-    # Iteratively remove preamble patterns until none remain at the start
     for _ in range(8):
         stripped = _LLM_PREAMBLE_RE.sub("", text, count=1).lstrip()
         if stripped == text.lstrip():
@@ -296,82 +291,34 @@ def _clean_llm_response(text: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 # LATEX → PLAIN-TEXT / UNICODE CONVERTER
 # ══════════════════════════════════════════════════════════════════════════════
-# Maps LaTeX commands → unicode / plain text
 _LATEX_UNICODE = {
-    r'\omega':   'ω',
-    r'\Omega':   'Ω',
-    r'\alpha':   'α',
-    r'\beta':    'β',
-    r'\gamma':   'γ',
-    r'\delta':   'δ',
-    r'\Delta':   'Δ',
-    r'\epsilon': 'ε',
-    r'\zeta':    'ζ',
-    r'\eta':     'η',
-    r'\theta':   'θ',
-    r'\Theta':   'Θ',
-    r'\lambda':  'λ',
-    r'\Lambda':  'Λ',
-    r'\mu':      'μ',
-    r'\nu':      'ν',
-    r'\xi':      'ξ',
-    r'\pi':      'π',
-    r'\Pi':      'Π',
-    r'\rho':     'ρ',
-    r'\sigma':   'σ',
-    r'\Sigma':   'Σ',
-    r'\tau':     'τ',
-    r'\phi':     'φ',
-    r'\Phi':     'Φ',
-    r'\chi':     'χ',
-    r'\psi':     'ψ',
-    r'\Psi':     'Ψ',
-    r'\infty':   '∞',
-    r'\cdot':    '·',
-    r'\times':   '×',
-    r'\approx':  '≈',
-    r'\geq':     '≥',
-    r'\leq':     '≤',
-    r'\neq':     '≠',
-    r'\pm':      '±',
-    r'\to':      '→',
-    r'\rightarrow': '→',
-    r'\leftarrow':  '←',
-    r'\int':     '∫',
-    r'\sum':     'Σ',
-    r'\prod':    'Π',
-    r'\partial': '∂',
-    r'\nabla':   '∇',
-    r'\in':      '∈',
-    r'\notin':   '∉',
-    r'\subset':  '⊂',
-    r'\cup':     '∪',
-    r'\cap':     '∩',
-    r'\forall':  '∀',
-    r'\exists':  '∃',
-    r'\sqrt':    '√',
-    r'\star':    '★',
+    r'\omega':   'ω', r'\Omega':   'Ω', r'\alpha':   'α', r'\beta':    'β',
+    r'\gamma':   'γ', r'\delta':   'δ', r'\Delta':   'Δ', r'\epsilon': 'ε',
+    r'\zeta':    'ζ', r'\eta':     'η', r'\theta':   'θ', r'\Theta':   'Θ',
+    r'\lambda':  'λ', r'\Lambda':  'Λ', r'\mu':      'μ', r'\nu':      'ν',
+    r'\xi':      'ξ', r'\pi':      'π', r'\Pi':      'Π', r'\rho':     'ρ',
+    r'\sigma':   'σ', r'\Sigma':   'Σ', r'\tau':     'τ', r'\phi':     'φ',
+    r'\Phi':     'Φ', r'\chi':     'χ', r'\psi':     'ψ', r'\Psi':     'Ψ',
+    r'\infty':   '∞', r'\cdot':    '·', r'\times':   '×', r'\approx':  '≈',
+    r'\geq':     '≥', r'\leq':     '≤', r'\neq':     '≠', r'\pm':      '±',
+    r'\to':      '→', r'\rightarrow': '→', r'\leftarrow': '←',
+    r'\int':     '∫', r'\sum':     'Σ', r'\prod':    'Π', r'\partial': '∂',
+    r'\nabla':   '∇', r'\in':      '∈', r'\notin':   '∉', r'\subset':  '⊂',
+    r'\cup':     '∪', r'\cap':     '∩', r'\forall':  '∀', r'\exists':  '∃',
+    r'\sqrt':    '√', r'\star':    '★',
 }
 
-# Superscript/subscript digit maps
 _SUP_DIGITS = str.maketrans('0123456789+-', '⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻')
 _SUB_DIGITS = str.maketrans('0123456789+-', '₀₁₂₃₄₅₆₇₈₉₊₋')
 
 
 def _frac_to_text(num: str, den: str) -> str:
-    """Render \frac{num}{den} as num/den."""
     return f"({num.strip()}/{den.strip()})"
 
 
 def _latex_to_plain(text: str) -> str:
-    """
-    Convert inline LaTeX ($...$  or  $$...$$) to readable plain-text / unicode.
-    Leaves non-math text untouched.
-    """
     def _convert_math(expr: str) -> str:
         s = expr
-
-        # \begin{cases}...\end{cases} → piecewise plain text
         def _cases(m):
             inner = m.group(1)
             branches = [b.strip() for b in re.split(r'\\\\', inner) if b.strip()]
@@ -381,34 +328,21 @@ def _latex_to_plain(text: str) -> str:
                 parts.append(_convert_math(b))
             return '{ ' + ' ; '.join(parts) + ' }'
         s = re.sub(r'\\begin\s*\{cases\}([\s\S]*?)\\end\s*\{cases\}', _cases, s)
-
-        # \frac{a}{b}
         def _frac(m):
             return _frac_to_text(m.group(1), m.group(2))
         s = re.sub(r'\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}', _frac, s)
-
-        # \mathcal{X}, \mathbf{X}, \mathrm{X}, \text{X}, \operatorname{X}, \rm X
         s = re.sub(r'\\(?:mathcal|mathbf|mathrm|text|operatorname)\s*\{([^}]*)\}', r'\1', s)
         s = re.sub(r'\\rm\s+([A-Za-z]+)', r'\1', s)
-
-        # Greek letters and symbols
         for cmd, uni in sorted(_LATEX_UNICODE.items(), key=lambda x: -len(x[0])):
             s = s.replace(cmd, uni)
-
-        # \left / \right
         s = re.sub(r'\\(?:left|right)\s*', '', s)
-
-        # Superscripts: ^{...} or ^x
         def _sup(m):
             inner = (m.group(1) or m.group(2) or '').strip()
-            # try digit-only translation
             try:
                 return inner.translate(_SUP_DIGITS)
             except Exception:
                 return f"^({inner})" if len(inner) > 1 else f"^{inner}"
         s = re.sub(r'\^\{([^}]*)\}|\^([A-Za-z0-9])', _sup, s)
-
-        # Subscripts: _{...} or _x
         def _sub(m):
             inner = (m.group(1) or m.group(2) or '').strip()
             try:
@@ -416,30 +350,19 @@ def _latex_to_plain(text: str) -> str:
             except Exception:
                 return f"_({inner})" if len(inner) > 1 else f"_{inner}"
         s = re.sub(r'_\{([^}]*)\}|_([A-Za-z0-9])', _sub, s)
-
-        # spacing commands
         s = re.sub(r'\\(?:quad|qquad|,|;|:|\s)', ' ', s)
-
-        # remaining backslash commands — just drop the backslash
         s = re.sub(r'\\([A-Za-z]+)', r'\1', s)
-
-        # clean up extra braces/spaces
         s = re.sub(r'[{}]', '', s)
         s = re.sub(r'  +', ' ', s).strip()
         return s
 
-    # Replace $$...$$ blocks
     def _replace_display(m):
         return '\n' + _convert_math(m.group(1).strip()) + '\n'
-
     text = re.sub(r'\$\$([\s\S]+?)\$\$', _replace_display, text)
 
-    # Replace $...$ inline
     def _replace_inline(m):
         return _convert_math(m.group(1))
-
     text = re.sub(r'\$([^$\n]+?)\$', _replace_inline, text)
-
     return text
 
 
@@ -447,28 +370,23 @@ def _latex_to_plain(text: str) -> str:
 # STRIP NON-RENDERABLE GLYPHS (emoji etc.) for matplotlib
 # ══════════════════════════════════════════════════════════════════════════════
 def _strip_non_renderable(text: str) -> str:
-    """Remove emoji and glyphs DejaVu Sans cannot render."""
     result = []
     for ch in text:
         cp = ord(ch)
         cat = unicodedata.category(ch)
-        # Allow standard ASCII + common extended Latin + math symbols
         if cp < 0x0300:
             result.append(ch)
             continue
-        # Keep Greek, math operators, common symbols
-        if 0x0300 <= cp <= 0x03FF:   # Greek / combining
+        if 0x0300 <= cp <= 0x03FF:
             result.append(ch)
-        elif 0x2000 <= cp <= 0x23FF: # General punctuation, arrows, math
+        elif 0x2000 <= cp <= 0x23FF:
             result.append(ch)
         elif cat.startswith(('L', 'N', 'P', 'Z', 'S')):
-            # Drop Symbol,other (So) above BMP — that's where most emoji live
             if cat == 'So' and cp > 0x2FFF:
                 continue
-            if cp > 0xFFFF:  # Supplementary planes (emoji, etc.)
+            if cp > 0xFFFF:
                 continue
             result.append(ch)
-        # else drop
     return ''.join(result)
 
 
@@ -476,10 +394,7 @@ def _strip_non_renderable(text: str) -> str:
 # LATEX / MATHTEXT SANITISER  (for matplotlib mathtext renderer)
 # ══════════════════════════════════════════════════════════════════════════════
 def _sanitise_mathtext(s: str) -> str:
-    # Strip non-renderable glyphs first
     s = _strip_non_renderable(s)
-
-    # ── FIX: convert \begin{cases}...\end{cases} to inline fallback ──────────
     def _cases_to_inline(m):
         inner = m.group(1)
         branches = [b.strip() for b in re.split(r'\\\\', inner) if b.strip()]
@@ -488,14 +403,8 @@ def _sanitise_mathtext(s: str) -> str:
             b = re.sub(r'\s*&\s*', r',\\ ', b).strip()
             parts.append(b)
         return r'\{\ ' + r'\ ;\ '.join(parts) + r'\ \}'
-    s = re.sub(
-        r'\\begin\s*\{cases\}([\s\S]*?)\\end\s*\{cases\}',
-        _cases_to_inline, s
-    )
-    # Remove any remaining \begin{...} / \end{...} that mathtext can't handle
+    s = re.sub(r'\\begin\s*\{cases\}([\s\S]*?)\\end\s*\{cases\}', _cases_to_inline, s)
     s = re.sub(r'\\(?:begin|end)\s*\{[^}]*\}', '', s)
-
-    # Unicode → LaTeX command substitutions
     s = s.replace('∞', r'\infty')
     s = s.replace('∑', r'\sum')
     s = s.replace('∫', r'\int')
@@ -845,7 +754,6 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
 async def send_llm_response(update: Update, response_text: str,
                              title: str, msg_id: int,
                              force_image: bool = False) -> None:
-    # Clean boilerplate preamble then convert LaTeX to plain unicode for text mode
     response_text = _clean_llm_response(response_text)
 
     if force_image or _is_math_title(title):
@@ -859,7 +767,6 @@ async def send_llm_response(update: Update, response_text: str,
                 return
             print(f"[send_llm_response] photo failed, falling back to text")
 
-    # Plain-text fallback: convert LaTeX markup to readable unicode
     plain_text = _latex_to_plain(response_text)
     for i in range(0, len(plain_text), 4096):
         await _safe_reply(update, plain_text[i:i + 4096])
@@ -1003,6 +910,10 @@ def _identify_fourier_rule_latex(expr: sp.Expr) -> str:
         return r"\mathcal{F}\{u(t)\} = \pi \delta(\omega) + \frac{1}{j\omega}"
     if "exp" in s and "sin" not in s and "cos" not in s:
         return r"\mathcal{F}\{e^{-at}u(t)\} = \frac{1}{a+j\omega},\quad a>0"
+    if "exp" in s and "cos" in s:
+        return r"\mathcal{F}\{e^{-at}\cos(\omega_0 t)u(t)\} = \frac{a+j\omega}{(a+j\omega)^2+\omega_0^2}"
+    if "exp" in s and "sin" in s:
+        return r"\mathcal{F}\{e^{-at}\sin(\omega_0 t)u(t)\} = \frac{\omega_0}{(a+j\omega)^2+\omega_0^2}"
     if "sin" in s:
         return r"\mathcal{F}\{\sin(\omega_0 t)\} = j\pi [\delta(\omega+\omega_0)-\delta(\omega-\omega_0)]"
     if "cos" in s:
@@ -1014,6 +925,7 @@ def _identify_fourier_rule_latex(expr: sp.Expr) -> str:
     return r"F(\omega) = \int_{-\infty}^{\infty} f(t)\,e^{-j\omega t}\,dt"
 
 def _fourier_direct(f: sp.Expr) -> sp.Expr:
+    # ── FIX 1 & 2: attempt symbolic integration first ─────────────────────────
     try:
         result = sp.integrate(f * sp.exp(-sp.I * w_sym * t_sym), (t_sym, -sp.oo, sp.oo))
         if not result.has(sp.Integral):
@@ -1022,12 +934,70 @@ def _fourier_direct(f: sp.Expr) -> sp.Expr:
         pass
 
     s = str(f)
-    if "cos" in s:
+
+    # ── FIX 2: damped cosine — e^{-at}*cos(w0*t)*u(t) ────────────────────────
+    if "exp" in s and "cos" in s and "Heaviside" in s:
+        try:
+            # Extract via Laplace shift: F(jω) where F(s) = (s+a)/((s+a)^2+w0^2)
+            result = sp.laplace_transform(f, t_sym, sp.I * w_sym, noconds=True)
+            result = sp.simplify(result)
+            result_tex = str(result)
+            if not "Integral" in result_tex and not "LaplaceTransform" in result_tex:
+                return result
+        except Exception:
+            pass
+        # Fallback: direct formula
+        m_cos = re.search(r'cos\(\s*([^)]+?)\s*\*?\s*t\b', s)
+        m_exp = re.search(r'exp\(\s*-\s*([^*\s)]+)\s*\*?\s*t\b', s)
+        if m_cos and m_exp:
+            try:
+                w0  = sp.sympify(m_cos.group(1).strip(), locals=_COMMON_NS)
+                a   = sp.sympify(m_exp.group(1).strip(), locals=_COMMON_NS)
+                num = a + sp.I * w_sym
+                den = (a + sp.I * w_sym)**2 + w0**2
+                return sp.simplify(num / den)
+            except Exception:
+                pass
+
+    # ── FIX 2: damped sine — e^{-at}*sin(w0*t)*u(t) ──────────────────────────
+    if "exp" in s and "sin" in s and "Heaviside" in s:
+        try:
+            result = sp.laplace_transform(f, t_sym, sp.I * w_sym, noconds=True)
+            result = sp.simplify(result)
+            result_tex = str(result)
+            if not "Integral" in result_tex and not "LaplaceTransform" in result_tex:
+                return result
+        except Exception:
+            pass
+        m_sin = re.search(r'sin\(\s*([^)]+?)\s*\*?\s*t\b', s)
+        m_exp = re.search(r'exp\(\s*-\s*([^*\s)]+)\s*\*?\s*t\b', s)
+        if m_sin and m_exp:
+            try:
+                w0  = sp.sympify(m_sin.group(1).strip(), locals=_COMMON_NS)
+                a   = sp.sympify(m_exp.group(1).strip(), locals=_COMMON_NS)
+                num = w0
+                den = (a + sp.I * w_sym)**2 + w0**2
+                return sp.simplify(num / den)
+            except Exception:
+                pass
+
+    # ── FIX 1: pure exponential — e^{-at}*u(t) ───────────────────────────────
+    if "exp" in s and "Heaviside" in s and "sin" not in s and "cos" not in s:
+        m_exp = re.search(r'exp\(\s*-\s*([^*\s)]+)\s*\*?\s*t\b', s)
+        if m_exp:
+            try:
+                a = sp.sympify(m_exp.group(1).strip(), locals=_COMMON_NS)
+                return sp.simplify(sp.Integer(1) / (a + sp.I * w_sym))
+            except Exception:
+                pass
+
+    # ── existing hardcoded pairs ───────────────────────────────────────────────
+    if "cos" in s and "exp" not in s:
         m = re.search(r'cos\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
         if m:
             w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
             return sp.pi * (sp.DiracDelta(w_sym - w0) + sp.DiracDelta(w_sym + w0))
-    if "sin" in s:
+    if "sin" in s and "exp" not in s:
         m = re.search(r'sin\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
         if m:
             w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
@@ -1543,7 +1513,7 @@ def compute_result(data: dict) -> str:
                 data["tutorials"] * WEIGHTS["tutorials"])
     req_exam = (PASS_MARK - weighted) / WEIGHTS["exam"]
     lines = [
-        "📊 *Your Mark Breakdown*\n",
+        "*Your Mark Breakdown*\n",
         f"  Test average:       {test_avg:.1f}%",
         f"  Labs average:       {data['labs']:.1f}%",
         f"  Tutorials average:  {data['tutorials']:.1f}%",
@@ -1959,21 +1929,23 @@ async def send_long_code(update: Update, text: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_reply(update,
-        "👋 Hi there! I'm your *Signals & Systems 1* tutor bot.\n\n"
-        "I am here to help you understand any Signals and Systems 1 topic that you may be struggling in, or need clarification in. Feel free to ask me any Signals and Systems 1 related questions. I can help you with the following calculations: \n"
-        "📡 *Laplace Transforms*\n" 
-        "📡 *Inverse Laplace Transforms*\n"
-        "📡 *Fourier Transform*\n"
-        "📡 *Inverse Fourier Transforms*\n"
-        "📡 *Convolution*\n"
-        "📊 *Plot signals*\n\n"
-        "I can also help you calculate how much you need in your exam to pass the course. Ask me anything, I am here for you. Do not suffer while I am here.\n"
+        "Hi there! I'm your *Signals & Systems 1* tutor bot.\n\n"
+        "I am here to help you understand any Signals and Systems 1 topic. "
+        "I can help you with the following calculations:\n"
+        "*Laplace Transforms*\n"
+        "*Inverse Laplace Transforms*\n"
+        "*Fourier Transform*\n"
+        "*Inverse Fourier Transforms*\n"
+        "*Convolution*\n"
+        "*Plot signals*\n\n"
+        "I can also help you calculate how much you need in your exam to pass. "
+        "Ask me anything — I am here for you.\n"
         "Use /help for the full guide.",
         parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_reply(update,
-        "👋 *Full guide:*\n\n"
+        "*Full guide:*\n\n"
         "1. *Laplace*           _laplace of e^(-2*t)*u(t)_\n"
         "2. *Inverse Laplace*   _inverse laplace of 1/(s+2)_\n"
         "   Also: _ilt of s/(s^2+4)_\n"
@@ -2013,15 +1985,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_id   = update.message.message_id
     chat_id  = update.effective_chat.id
 
-    # ── 1. Mark calculator ────────────────────────────────────────────────────
     if await handle_mark_session(update, context):
         return
 
-    # ── 2. Session-based document Q&A ─────────────────────────────────────────
     if session_has(chat_id):
         sess = session_get(chat_id)
         await _safe_reply(update,
-            f"⏳ Working on it using *{sess['source']}* as reference…",
+            f"Working on it using *{sess['source']}* as reference…",
             parse_mode="Markdown")
 
         pending_work = context.user_data.pop("pending_student_work", None)
@@ -2042,8 +2012,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return
 
-    # ── 3. Math tools ─────────────────────────────────────────────────────────
-
     if is_inv_laplace(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
@@ -2052,7 +2020,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "  _inverse laplace of 1/(s+2)_\n"
                 "  _ilt of s/(s^2+4)_", parse_mode="Markdown")
             return
-        await _safe_reply(update, "⏳ Computing Inverse Laplace transform…")
+        await _safe_reply(update, "Computing Inverse Laplace transform…")
         steps, err = _build_inv_laplace_steps(expr_str)
         if err:
             await _safe_reply(update, err)
@@ -2075,7 +2043,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "  _inverse fourier of 1/(1+j*omega)_\n"
                 "  _ift of 2*pi*DiracDelta(omega)_", parse_mode="Markdown")
             return
-        await _safe_reply(update, "⏳ Computing Inverse Fourier transform…")
+        await _safe_reply(update, "Computing Inverse Fourier transform…")
         steps, err = _build_inv_fourier_steps(expr_str)
         if err:
             await _safe_reply(update, err)
@@ -2102,7 +2070,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
             return
         await _safe_reply(update,
-            f"⏳ Computing periodic summation Fourier (g(t)={g_str}, T={period_val})…")
+            f"Computing periodic summation Fourier (g(t)={g_str}, T={period_val})…")
         steps, err = _build_periodic_fourier_steps(g_str, period_val)
         if err:
             await _safe_reply(update, err)
@@ -2120,7 +2088,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Please include an expression, e.g.:\n"
                 "  _laplace of e^(-2*t)*u(t)_", parse_mode="Markdown")
             return
-        await _safe_reply(update, "⏳ Computing Laplace transform…")
+        await _safe_reply(update, "Computing Laplace transform…")
         steps, err = _build_laplace_steps(expr_str)
         if err:
             await _safe_reply(update, err)
@@ -2142,7 +2110,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Please include an expression, e.g.:\n"
                 "  _fourier transform of e^(-t)*u(t)_", parse_mode="Markdown")
             return
-        await _safe_reply(update, "⏳ Computing Fourier transform…")
+        await _safe_reply(update, "Computing Fourier transform…")
         steps, err = _build_fourier_steps(expr_str)
         if err:
             await _safe_reply(update, err)
@@ -2169,7 +2137,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             expr_str = re.sub(r',?\s*[Tt]\s*=\s*[^\s]+', '', question).strip()
             expr_str = extract_expr(expr_str) or expr_str
         await _safe_reply(update,
-            f"⏳ Computing Fourier series for f(t)={expr_str}, T={period:.4g}…")
+            f"Computing Fourier series for f(t)={expr_str}, T={period:.4g}…")
         steps, err = _build_fourier_series_steps(expr_str, period)
         if err:
             await _safe_reply(update, err)
@@ -2192,7 +2160,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "  _convolve e^(-t)*u(t) with u(t)_", parse_mode="Markdown")
             return
         await _safe_reply(update,
-            f"⏳ Computing convolution of f(t)={e1} and g(t)={e2}…")
+            f"Computing convolution of f(t)={e1} and g(t)={e2}…")
         steps, err, plot_path = _build_convolution_steps(e1, e2, msg_id)
         if err:
             await _safe_reply(update, err)
@@ -2214,10 +2182,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if is_plot(q_lower):
-        await _safe_reply(update, "📊 Generating plot…")
+        await _safe_reply(update, "Generating plot…")
         fig_path = generate_plot(question, msg_id)
         if fig_path and os.path.exists(fig_path):
-            success = await _safe_reply_photo(update, fig_path, f"📈 {question}")
+            success = await _safe_reply_photo(update, fig_path, f"{question}")
             if not success:
                 await _safe_reply(update,
                     "Plot generated but could not be sent. Please try again.")
@@ -2228,11 +2196,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
         return
 
-    # ── 4. General tutor Q&A via RAG ──────────────────────────────────────────
     if not qa_chain:
         await _safe_reply(update, "No knowledge base loaded.")
         return
-    await _safe_reply(update, "🤔 Thinking…")
+    await _safe_reply(update, "Thinking…")
     try:
         answer = qa_chain.invoke(question)
         answer = _clean_llm_response(answer)
@@ -2249,8 +2216,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg_id  = update.message.message_id
 
-    await _safe_reply(update,
-        "📷 Got your photo — running OCR… (~15–30s)")
+    await _safe_reply(update, "Got your photo — running OCR… (~15–30s)")
 
     import io
     photo_file  = await update.message.photo[-1].get_file()
@@ -2267,7 +2233,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark_keywords = ["mark", "check", "compare", "grade", "evaluate", "feedback"]
         if sess and any(kw in caption.lower() for kw in mark_keywords):
             await _safe_reply(update,
-                f"⏳ Marking against *{sess['source']}*…", parse_mode="Markdown")
+                f"Marking against *{sess['source']}*…", parse_mode="Markdown")
             prompt   = _prompt_mark(sess["text"], extracted)
             response = _call_llm(prompt)
             response = _clean_llm_response(response)
@@ -2275,13 +2241,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_llm_response(update, response,
                                     f"Marking Feedback — {sess['source']}", msg_id)
             session_clear(chat_id)
-            await _safe_reply(update,
-                "_(Session cleared.)_", parse_mode="Markdown")
+            await _safe_reply(update, "_(Session cleared.)_", parse_mode="Markdown")
         else:
             doc_text = sess["text"] if sess else extracted
             source   = sess["source"] if sess else "handwritten photo"
             await _safe_reply(update,
-                f"⏳ Processing using *{source}* as reference…",
+                f"Processing using *{source}* as reference…",
                 parse_mode="Markdown")
             prompt   = _route_session_prompt(doc_text, caption)
             response = _call_llm(prompt)
@@ -2367,11 +2332,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif is_plot(q_lower):
                 fig_path = generate_plot(routed_command, msg_id)
                 if fig_path and os.path.exists(fig_path):
-                    if await _safe_reply_photo(update, fig_path, f"📈 {routed_command}"):
+                    if await _safe_reply_photo(update, fig_path, f"{routed_command}"):
                         return
 
             if qa_chain:
-                await _safe_reply(update, "🤔 Solving with tutor…")
+                await _safe_reply(update, "Solving with tutor…")
                 try:
                     answer = qa_chain.invoke(extracted)
                     answer = _clean_llm_response(answer)
@@ -2415,7 +2380,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await _safe_reply(update,
-        f"📄 Received *{file_name}* — extracting content…",
+        f"Received *{file_name}* — extracting content…",
         parse_mode="Markdown")
 
     tg_file = await doc.get_file()
@@ -2452,7 +2417,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if caption:
         sess   = session_get(chat_id)
         await _safe_reply(update,
-            f"⏳ Acting on your caption: _{caption}_…",
+            f"Acting on your caption: _{caption}_…",
             parse_mode="Markdown")
         prompt   = _route_session_prompt(sess["text"], caption)
         response = _call_llm(prompt)
@@ -2502,3 +2467,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
