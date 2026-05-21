@@ -469,7 +469,7 @@ def _sanitise_mathtext(s: str) -> str:
     s = re.sub(r'\\mathscr\{([^}]+)\}',     r'\\mathbf{\1}', s)
     s = re.sub(r'\\mathrm\{([^}]+)\}',      r'\\rm \1',      s)
     s = re.sub(r'\\operatorname\{([^}]+)\}', r'\\rm \1',      s)
-    s = re.sub(r'\\text\{([^]*)\}',         r'\\rm \1',      s)
+    s = re.sub(r'\\text\{([^}]*)\}',        r'\\rm \1',      s)
     # Spacing commands
     s = s.replace(r'\qquad', r'\ \ \ \ ')
     s = s.replace(r'\quad',  r'\ \ ')
