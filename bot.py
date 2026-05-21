@@ -140,7 +140,6 @@ def _normalise(expr: str) -> str:
     s = expr.strip()
     s = s.replace("^", "**").replace("{", "(").replace("}", ")")
     s = re.sub(r'\brect\s*\(',                      'rect(',          s)
-    # ── FIX 3: insert * between digit and u( before mapping u(t) → Heaviside ─
     s = re.sub(r'(\d)(u\s*[\(\[])',                  r'\1*\2',         s)
     s = re.sub(r'\bu\s*\(\s*t\s*\)',                'Heaviside(t)',   s)
     s = re.sub(r'\bu\s*\(\s*t\s*([+-][^)]+)\)',     r'Heaviside(t\1)', s)
@@ -772,6 +771,27 @@ async def send_llm_response(update: Update, response_text: str,
         await _safe_reply(update, plain_text[i:i + 4096])
 
 # ══════════════════════════════════════════════════════════════════════════════
+# LLM / RAG FALLBACK  (used when symbolic math fails)
+# ══════════════════════════════════════════════════════════════════════════════
+async def _llm_fallback(update: Update, question: str,
+                         title: str, msg_id: int) -> None:
+    """Route to LLM/RAG when symbolic computation fails."""
+    await _safe_reply(update, "Let me work through that for you…")
+    try:
+        if qa_chain:
+            answer = qa_chain.invoke(question)
+        else:
+            answer = _call_llm(
+                f"{_LATEX_INSTRUCTION}\n\nYou are a Signals and Systems tutor.\n\n"
+                f"Question: {question}\n\nAnswer:"
+            )
+        answer = _clean_llm_response(answer)
+        answer = _latex_to_plain(answer)
+        await send_llm_response(update, answer, title, msg_id)
+    except Exception as e:
+        await _safe_reply(update, f"Could not answer: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LAPLACE STEP BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_laplace_rule_latex(expr: sp.Expr) -> str:
@@ -820,7 +840,7 @@ def _build_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         steps.append(("Result", rf"F(s) = {_sympy_to_latex(result)}"))
         return steps, ""
     except Exception as e:
-        return [], f"Could not compute Laplace transform: {e}"
+        return [], f"laplace_failed: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INVERSE LAPLACE STEP BUILDER
@@ -874,7 +894,7 @@ def _build_inv_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]
         return steps, ""
 
     except Exception as e:
-        return [], f"Could not compute Inverse Laplace transform: {e}"
+        return [], f"inv_laplace_failed: {e}"
 
 def compute_inv_laplace(expr_str: str) -> str:
     lines = ["--- INVERSE LAPLACE TRANSFORM ---\n"]
@@ -925,93 +945,122 @@ def _identify_fourier_rule_latex(expr: sp.Expr) -> str:
     return r"F(\omega) = \int_{-\infty}^{\infty} f(t)\,e^{-j\omega t}\,dt"
 
 def _fourier_direct(f: sp.Expr) -> sp.Expr:
-    # ── FIX 1 & 2: attempt symbolic integration first ─────────────────────────
+    # ── Extract leading scalar coefficient so it isn't lost ──────────────────
+    coeff = sp.Integer(1)
+    core  = f
+    if f.is_Mul:
+        num_factors = [a for a in f.args if a.is_number]
+        if num_factors:
+            coeff = sp.Mul(*num_factors)
+            core  = f / coeff
+
+    # ── Attempt symbolic integration first (works for rect, piecewise, etc.) ─
     try:
-        result = sp.integrate(f * sp.exp(-sp.I * w_sym * t_sym), (t_sym, -sp.oo, sp.oo))
+        result = sp.integrate(
+            core * sp.exp(-sp.I * w_sym * t_sym), (t_sym, -sp.oo, sp.oo)
+        )
         if not result.has(sp.Integral):
-            return sp.simplify(result)
+            return sp.simplify(coeff * result)
     except Exception:
         pass
 
-    s = str(f)
+    s = str(core)
 
-    # ── FIX 2: damped cosine — e^{-at}*cos(w0*t)*u(t) ────────────────────────
+    # ── Damped cosine: e^{-at}*cos(w0*t)*u(t) ────────────────────────────────
     if "exp" in s and "cos" in s and "Heaviside" in s:
         try:
-            # Extract via Laplace shift: F(jω) where F(s) = (s+a)/((s+a)^2+w0^2)
-            result = sp.laplace_transform(f, t_sym, sp.I * w_sym, noconds=True)
+            result = sp.laplace_transform(core, t_sym, sp.I * w_sym, noconds=True)
             result = sp.simplify(result)
-            result_tex = str(result)
-            if not "Integral" in result_tex and not "LaplaceTransform" in result_tex:
-                return result
+            if "Integral" not in str(result) and "LaplaceTransform" not in str(result):
+                return sp.simplify(coeff * result)
         except Exception:
             pass
-        # Fallback: direct formula
-        m_cos = re.search(r'cos\(\s*([^)]+?)\s*\*?\s*t\b', s)
-        m_exp = re.search(r'exp\(\s*-\s*([^*\s)]+)\s*\*?\s*t\b', s)
+        # Fallback: direct formula from SymPy repr
+        m_cos = re.search(r'cos\(([^,)]+)\*t\b|cos\(t\*([^,)]+)', s)
+        m_exp = re.search(r'exp\(-([^*\s)]+)\*t\b|exp\(t\*\((-[^)]+)\)', s)
         if m_cos and m_exp:
             try:
-                w0  = sp.sympify(m_cos.group(1).strip(), locals=_COMMON_NS)
-                a   = sp.sympify(m_exp.group(1).strip(), locals=_COMMON_NS)
+                w0_raw = (m_cos.group(1) or m_cos.group(2) or '').strip()
+                a_raw  = (m_exp.group(1) or m_exp.group(2) or '').strip().lstrip('-')
+                w0 = sp.sympify(w0_raw, locals=_COMMON_NS)
+                a  = sp.sympify(a_raw,  locals=_COMMON_NS)
                 num = a + sp.I * w_sym
                 den = (a + sp.I * w_sym)**2 + w0**2
-                return sp.simplify(num / den)
+                return sp.simplify(coeff * num / den)
             except Exception:
                 pass
 
-    # ── FIX 2: damped sine — e^{-at}*sin(w0*t)*u(t) ──────────────────────────
+    # ── Damped sine: e^{-at}*sin(w0*t)*u(t) ──────────────────────────────────
     if "exp" in s and "sin" in s and "Heaviside" in s:
         try:
-            result = sp.laplace_transform(f, t_sym, sp.I * w_sym, noconds=True)
+            result = sp.laplace_transform(core, t_sym, sp.I * w_sym, noconds=True)
             result = sp.simplify(result)
-            result_tex = str(result)
-            if not "Integral" in result_tex and not "LaplaceTransform" in result_tex:
-                return result
+            if "Integral" not in str(result) and "LaplaceTransform" not in str(result):
+                return sp.simplify(coeff * result)
         except Exception:
             pass
-        m_sin = re.search(r'sin\(\s*([^)]+?)\s*\*?\s*t\b', s)
-        m_exp = re.search(r'exp\(\s*-\s*([^*\s)]+)\s*\*?\s*t\b', s)
+        m_sin = re.search(r'sin\(([^,)]+)\*t\b|sin\(t\*([^,)]+)', s)
+        m_exp = re.search(r'exp\(-([^*\s)]+)\*t\b|exp\(t\*\((-[^)]+)\)', s)
         if m_sin and m_exp:
             try:
-                w0  = sp.sympify(m_sin.group(1).strip(), locals=_COMMON_NS)
-                a   = sp.sympify(m_exp.group(1).strip(), locals=_COMMON_NS)
+                w0_raw = (m_sin.group(1) or m_sin.group(2) or '').strip()
+                a_raw  = (m_exp.group(1) or m_exp.group(2) or '').strip().lstrip('-')
+                w0 = sp.sympify(w0_raw, locals=_COMMON_NS)
+                a  = sp.sympify(a_raw,  locals=_COMMON_NS)
                 num = w0
                 den = (a + sp.I * w_sym)**2 + w0**2
-                return sp.simplify(num / den)
+                return sp.simplify(coeff * num / den)
             except Exception:
                 pass
 
-    # ── FIX 1: pure exponential — e^{-at}*u(t) ───────────────────────────────
+    # ── Pure exponential: e^{-at}*u(t) ───────────────────────────────────────
     if "exp" in s and "Heaviside" in s and "sin" not in s and "cos" not in s:
-        m_exp = re.search(r'exp\(\s*-\s*([^*\s)]+)\s*\*?\s*t\b', s)
+        m_exp = re.search(r'exp\(-([^*\s)]+)\*t\b|exp\(t\*\((-[^)]+)\)', s)
         if m_exp:
             try:
-                a = sp.sympify(m_exp.group(1).strip(), locals=_COMMON_NS)
-                return sp.simplify(sp.Integer(1) / (a + sp.I * w_sym))
+                a_raw = (m_exp.group(1) or m_exp.group(2) or '').strip().lstrip('-')
+                a = sp.sympify(a_raw, locals=_COMMON_NS)
+                return sp.simplify(coeff / (a + sp.I * w_sym))
             except Exception:
                 pass
 
-    # ── existing hardcoded pairs ───────────────────────────────────────────────
+    # ── Pure cosine: A*cos(w0*t) ──────────────────────────────────────────────
     if "cos" in s and "exp" not in s:
-        m = re.search(r'cos\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
+        m = re.search(r'cos\(([^,)]+)\*t\b|cos\(t\*([^,)]+)', s)
         if m:
-            w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
-            return sp.pi * (sp.DiracDelta(w_sym - w0) + sp.DiracDelta(w_sym + w0))
+            w0_raw = (m.group(1) or m.group(2) or '').strip()
+            try:
+                w0 = sp.sympify(w0_raw, locals=_COMMON_NS)
+                return coeff * sp.pi * (
+                    sp.DiracDelta(w_sym - w0) + sp.DiracDelta(w_sym + w0)
+                )
+            except Exception:
+                pass
+
+    # ── Pure sine: A*sin(w0*t) ────────────────────────────────────────────────
     if "sin" in s and "exp" not in s:
-        m = re.search(r'sin\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
+        m = re.search(r'sin\(([^,)]+)\*t\b|sin\(t\*([^,)]+)', s)
         if m:
-            w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
-            return sp.I * sp.pi * (sp.DiracDelta(w_sym + w0) - sp.DiracDelta(w_sym - w0))
+            w0_raw = (m.group(1) or m.group(2) or '').strip()
+            try:
+                w0 = sp.sympify(w0_raw, locals=_COMMON_NS)
+                return coeff * sp.I * sp.pi * (
+                    sp.DiracDelta(w_sym + w0) - sp.DiracDelta(w_sym - w0)
+                )
+            except Exception:
+                pass
+
+    # ── Unit step: A*u(t) ─────────────────────────────────────────────────────
     if "Heaviside" in s and "exp" not in s:
-        coeff = sp.Integer(1)
-        if f.is_Mul:
-            nums = [a for a in f.args if a.is_number]
-            if nums:
-                coeff = sp.Mul(*nums)
-        return sp.simplify(coeff * (sp.pi * sp.DiracDelta(w_sym) + 1 / (sp.I * w_sym)))
-    if f == sp.Integer(1):
-        return 2 * sp.pi * sp.DiracDelta(w_sym)
-    raise ValueError("No closed-form pair found")
+        return sp.simplify(
+            coeff * (sp.pi * sp.DiracDelta(w_sym) + 1 / (sp.I * w_sym))
+        )
+
+    # ── Constant: A ───────────────────────────────────────────────────────────
+    if core == sp.Integer(1):
+        return coeff * 2 * sp.pi * sp.DiracDelta(w_sym)
+
+    raise ValueError("No closed-form Fourier pair found")
 
 def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
     steps: list[tuple[str, str]] = []
@@ -1028,7 +1077,7 @@ def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         steps.append(("Result", rf"F(\omega) = {result_tex}"))
         return steps, ""
     except Exception as e:
-        return [], f"Could not compute Fourier transform: {e}"
+        return [], f"fourier_failed: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INVERSE FOURIER STEP BUILDER
@@ -1083,7 +1132,7 @@ def _build_inv_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]
         return steps, ""
 
     except Exception as e:
-        return [], f"Could not compute Inverse Fourier transform: {e}"
+        return [], f"inv_fourier_failed: {e}"
 
 def compute_inv_fourier(expr_str: str) -> str:
     lines = ["--- INVERSE FOURIER TRANSFORM ---\n"]
@@ -1149,74 +1198,7 @@ def _build_periodic_fourier_steps(g_expr_str: str, period: float = 2.0
                        rf"G(n\omega_0)\,\delta(\omega-n\omega_0)"))
         return steps, ""
     except Exception as e:
-        return [], f"Could not compute periodic Fourier transform: {e}"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FOURIER SERIES STEP BUILDER
-# ══════════════════════════════════════════════════════════════════════════════
-def _build_fourier_series_steps(expr_str: str, period: float,
-                                 n_terms: int = 5) -> tuple[list[tuple[str, str]], str]:
-    steps: list[tuple[str, str]] = []
-    try:
-        f     = parse_ct_expr(expr_str)
-        f_tex = _sympy_to_latex(f)
-        T     = sp.Rational(period).limit_denominator(1000)
-        w0    = 2 * sp.pi / T
-        w0_tex = _sympy_to_latex(w0)
-
-        steps.append(("Input",  rf"f(t) = {f_tex},\quad T = {_sympy_to_latex(T)}"))
-        steps.append(("Fund. freq.", rf"\omega_0 = \frac{{2\pi}}{{T}} = {w0_tex}\ \mathrm{{rad/s}}"))
-        steps.append(("Coefficients",
-                       r"a_0=\frac{1}{T}\int_0^T f(t)\,dt,\quad"
-                       r"a_n=\frac{2}{T}\int_0^T f(t)\cos(n\omega_0 t)\,dt,\quad"
-                       r"b_n=\frac{2}{T}\int_0^T f(t)\sin(n\omega_0 t)\,dt"))
-
-        a0 = sp.simplify(sp.integrate(f, (t_sym, 0, T)) / T)
-        steps.append(("a0 (DC)", rf"a_0 = {_sympy_to_latex(a0)}"))
-
-        for k in range(1, n_terms + 1):
-            try:
-                an = sp.simplify(2 * sp.integrate(f * sp.cos(k * w0 * t_sym), (t_sym, 0, T)) / T)
-                bn = sp.simplify(2 * sp.integrate(f * sp.sin(k * w0 * t_sym), (t_sym, 0, T)) / T)
-                steps.append((f"n = {k}",
-                               rf"a_{{{k}}}={_sympy_to_latex(an)},\quad b_{{{k}}}={_sympy_to_latex(bn)}"))
-            except Exception:
-                steps.append((f"n = {k}", r"\text{could not evaluate}"))
-
-        try:
-            series = sp.fourier_series(f, (t_sym, 0, T))
-            trunc  = series.truncate(n_terms)
-            steps.append(("Truncated series",
-                           rf"f(t)\approx {_sympy_to_latex(trunc)}"))
-        except Exception:
-            pass
-
-        return steps, ""
-    except Exception as e:
-        return [], f"Could not compute Fourier series: {e}"
-
-def compute_fourier_series(expr_str: str, period: float, n_terms: int = 5) -> str:
-    lines = ["--- FOURIER SERIES ---\n"]
-    lines.append(f"Input: f(t) = {expr_str},  T = {period:.4g}\n")
-    try:
-        f = parse_ct_expr(expr_str)
-    except Exception as e:
-        return f"Could not parse expression: {e}"
-    T  = sp.Rational(period).limit_denominator(1000)
-    w0 = 2 * sp.pi / T
-    try:
-        a0 = sp.simplify(sp.integrate(f, (t_sym, 0, T)) / T)
-        lines.append(f"a₀ = {sp.pretty(a0)}")
-    except Exception:
-        pass
-    try:
-        series = sp.fourier_series(f, (t_sym, 0, T))
-        trunc  = series.truncate(n_terms)
-        lines.append(f"\nf(t) ≈ {sp.pretty(trunc)}")
-        lines.append("\nSeries computed successfully.")
-    except Exception as e:
-        lines.append(f"\n{e}")
-    return "\n".join(lines)
+        return [], f"periodic_fourier_failed: {e}"
 
 def compute_fourier(expr_str: str) -> str:
     lines = ["--- FOURIER TRANSFORM ---\n"]
@@ -1312,7 +1294,7 @@ def _build_convolution_steps(expr1_str: str, expr2_str: str,
         f = parse_ct_expr(expr1_str)
         g = parse_ct_expr(expr2_str)
     except Exception as e:
-        return [], f"Could not parse signals: {e}", None
+        return [], f"conv_failed: {e}", None
 
     steps.append(("f(t)",       _sympy_to_latex(f)))
     steps.append(("g(t)",       _sympy_to_latex(g)))
@@ -1468,7 +1450,6 @@ FOURIER_KEYS     = ["fourier transform", "ft{", "fourier of", "f transform",
                     "ft of", "compute ft", "find ft", "f.t. of", "fourier tf"]
 INV_FOURIER_KEYS = ["inverse fourier", "inv fourier", "ift", "ifourier",
                     "inverse ft", "inverse f transform", "fourier inverse"]
-FS_KEYS          = ["fourier series", "periodic signal", "series of"]
 CONV_KEYS        = ["convolution", "convolve", "f*g", "f★g", "f star g"]
 PERIODIC_FOURIER_KEYS = ["sum", "summation", "periodic summation",
                           "x(t) =", "x(t)=", "k=-inf", "g(t-2k)", "g(t -"]
@@ -1481,11 +1462,36 @@ def is_inv_fourier(q: str) -> bool:  return any(k in q for k in INV_FOURIER_KEYS
 def is_fourier(q: str) -> bool:
     if is_inv_fourier(q): return False
     return any(k in q for k in FOURIER_KEYS)
-def is_fs(q: str)   -> bool:  return any(k in q for k in FS_KEYS)
 def is_conv(q: str) -> bool:  return any(k in q for k in CONV_KEYS)
 def is_plot(q: str) -> bool:  return any(k in q for k in PLOT_KEYWORDS)
 def is_periodic_fourier(q: str) -> bool:
     return any(k in q for k in FOURIER_KEYS) and any(k in q for k in PERIODIC_FOURIER_KEYS)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Guard: does the question actually contain a parseable math expression?
+# Used to prevent conceptual questions ("what is a laplace transform") from
+# being routed into the symbolic engine and producing a parse error.
+# ──────────────────────────────────────────────────────────────────────────────
+_MATH_INDICATOR_RE = re.compile(
+    r'[(){}\[\]]'                          # brackets
+    r'|[+\-*/^]'                           # operators
+    r'|\b(?:sin|cos|exp|sqrt|log|rect)\b'  # known functions
+    r'|\b[eE]\^'                           # e^ notation
+    r'|\bt\b|\bn\b|\bs\b'                  # signal variables
+    r'|\bu\s*[\(\[]'                       # u(t) / u[n]
+    r'|\d+\s*\*'                           # digit followed by multiply
+    r'|\b\d+\.\d+\b'                       # decimal number
+    r'|delta|δ|omega|ω'                    # common signal terms
+    , re.IGNORECASE
+)
+
+def _has_math_expr(question: str) -> bool:
+    """Return True only if the question contains something that looks like a
+    mathematical expression, not just conceptual words."""
+    # Strip the keyword prefix first so we only check what's left
+    stripped = _QUESTION_PREFIX.sub('', question.strip())
+    stripped = _VERB_PREFIX.sub('', stripped).strip()
+    return bool(_MATH_INDICATOR_RE.search(stripped))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MARK CALCULATOR
@@ -2012,7 +2018,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return
 
+    # ── Inverse Laplace ───────────────────────────────────────────────────────
     if is_inv_laplace(q_lower):
+        if not _has_math_expr(question):
+            # Conceptual question — go straight to LLM
+            await _llm_fallback(update, question, "Tutor Answer", msg_id)
+            return
         expr_str = extract_expr(question)
         if not expr_str:
             await _safe_reply(update,
@@ -2023,19 +2034,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(update, "Computing Inverse Laplace transform…")
         steps, err = _build_inv_laplace_steps(expr_str)
         if err:
-            await _safe_reply(update, err)
+            # Symbolic failed — fall back to LLM
+            await _llm_fallback(update, question, "Inverse Laplace Transform", msg_id)
         else:
             png = _render_math_png("Inverse Laplace Transform", steps, msg_id)
             if png and os.path.exists(png):
                 success = await _safe_reply_photo(
                     update, png, f"Inverse Laplace of  F(s) = {expr_str}")
                 if not success:
-                    await send_long_code(update, compute_inv_laplace(expr_str))
+                    await _llm_fallback(update, question, "Inverse Laplace Transform", msg_id)
             else:
-                await send_long_code(update, compute_inv_laplace(expr_str))
+                await _llm_fallback(update, question, "Inverse Laplace Transform", msg_id)
         return
 
+    # ── Inverse Fourier ───────────────────────────────────────────────────────
     if is_inv_fourier(q_lower):
+        if not _has_math_expr(question):
+            await _llm_fallback(update, question, "Tutor Answer", msg_id)
+            return
         expr_str = extract_expr(question)
         if not expr_str:
             await _safe_reply(update,
@@ -2046,21 +2062,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(update, "Computing Inverse Fourier transform…")
         steps, err = _build_inv_fourier_steps(expr_str)
         if err:
-            await _safe_reply(update, err)
+            await _llm_fallback(update, question, "Inverse Fourier Transform", msg_id)
         else:
             png = _render_math_png("Inverse Fourier Transform", steps, msg_id)
             if png and os.path.exists(png):
                 success = await _safe_reply_photo(
                     update, png, f"Inverse Fourier of  F(ω) = {expr_str}")
                 if not success:
-                    await send_long_code(update, compute_inv_fourier(expr_str))
+                    await _llm_fallback(update, question, "Inverse Fourier Transform", msg_id)
             else:
-                await send_long_code(update, compute_inv_fourier(expr_str))
+                await _llm_fallback(update, question, "Inverse Fourier Transform", msg_id)
         return
 
+    # ── Periodic Fourier ──────────────────────────────────────────────────────
     if is_periodic_fourier(q_lower):
         period_val = _extract_period(question) or 2.0
-        g_str = None
         g_def_q = re.search(r'g\s*\(\s*t\s*\)\s*=\s*([^,\n]+)', question, re.IGNORECASE)
         g_str = g_def_q.group(1).strip() if g_def_q else None
         if not g_str:
@@ -2073,15 +2089,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Computing periodic summation Fourier (g(t)={g_str}, T={period_val})…")
         steps, err = _build_periodic_fourier_steps(g_str, period_val)
         if err:
-            await _safe_reply(update, err)
+            await _llm_fallback(update, question, "Fourier Transform (Periodic)", msg_id)
         else:
             png = _render_math_png("Fourier Transform  (Periodic Summation)", steps, msg_id)
             if png and os.path.exists(png):
                 await _safe_reply_photo(update, png,
                     f"Periodic Fourier: x(t)=sum g(t-{period_val}k), g(t)={g_str}, T={period_val}")
+            else:
+                await _llm_fallback(update, question, "Fourier Transform (Periodic)", msg_id)
         return
 
+    # ── Laplace ───────────────────────────────────────────────────────────────
     if is_laplace(q_lower):
+        if not _has_math_expr(question):
+            await _llm_fallback(update, question, "Tutor Answer", msg_id)
+            return
         expr_str = extract_expr(question)
         if not expr_str:
             await _safe_reply(update,
@@ -2091,19 +2113,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(update, "Computing Laplace transform…")
         steps, err = _build_laplace_steps(expr_str)
         if err:
-            await _safe_reply(update, err)
+            await _llm_fallback(update, question, "Laplace Transform", msg_id)
         else:
             png = _render_math_png("Laplace Transform", steps, msg_id)
             if png and os.path.exists(png):
                 success = await _safe_reply_photo(
                     update, png, f"Laplace Transform of  f(t) = {expr_str}")
                 if not success:
-                    await send_long_code(update, compute_laplace(expr_str))
+                    await _llm_fallback(update, question, "Laplace Transform", msg_id)
             else:
-                await send_long_code(update, compute_laplace(expr_str))
+                await _llm_fallback(update, question, "Laplace Transform", msg_id)
         return
 
+    # ── Fourier ───────────────────────────────────────────────────────────────
     if is_fourier(q_lower):
+        if not _has_math_expr(question):
+            await _llm_fallback(update, question, "Tutor Answer", msg_id)
+            return
         expr_str = extract_expr(question)
         if not expr_str:
             await _safe_reply(update,
@@ -2113,45 +2139,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(update, "Computing Fourier transform…")
         steps, err = _build_fourier_steps(expr_str)
         if err:
-            await _safe_reply(update, err)
+            await _llm_fallback(update, question, "Fourier Transform", msg_id)
         else:
             png = _render_math_png("Fourier Transform", steps, msg_id)
             if png and os.path.exists(png):
                 success = await _safe_reply_photo(
                     update, png, f"Fourier Transform of  f(t) = {expr_str}")
                 if not success:
-                    await send_long_code(update, compute_fourier(expr_str))
+                    await _llm_fallback(update, question, "Fourier Transform", msg_id)
             else:
-                await send_long_code(update, compute_fourier(expr_str))
+                await _llm_fallback(update, question, "Fourier Transform", msg_id)
         return
 
-    if is_fs(q_lower):
-        period = _extract_period(question)
-        if not period:
-            await _safe_reply(update,
-                "Please include the period, e.g.:\n"
-                "  _fourier series of t, T=2_", parse_mode="Markdown")
-            return
-        expr_str = extract_expr(question)
-        if not expr_str:
-            expr_str = re.sub(r',?\s*[Tt]\s*=\s*[^\s]+', '', question).strip()
-            expr_str = extract_expr(expr_str) or expr_str
-        await _safe_reply(update,
-            f"Computing Fourier series for f(t)={expr_str}, T={period:.4g}…")
-        steps, err = _build_fourier_series_steps(expr_str, period)
-        if err:
-            await _safe_reply(update, err)
-        else:
-            png = _render_math_png("Fourier Series", steps, msg_id)
-            if png and os.path.exists(png):
-                success = await _safe_reply_photo(
-                    update, png, f"Fourier Series: f(t)={expr_str}, T={period:.4g}")
-                if not success:
-                    await send_long_code(update, compute_fourier_series(expr_str, period))
-            else:
-                await send_long_code(update, compute_fourier_series(expr_str, period))
-        return
-
+    # ── Convolution ───────────────────────────────────────────────────────────
     if is_conv(q_lower):
         e1, e2 = _parse_two_signals(question)
         if not (e1 and e2):
@@ -2163,39 +2163,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Computing convolution of f(t)={e1} and g(t)={e2}…")
         steps, err, plot_path = _build_convolution_steps(e1, e2, msg_id)
         if err:
-            await _safe_reply(update, err)
+            await _llm_fallback(update, question, "Convolution", msg_id)
+            return
+        png = _render_math_png("Convolution  (f * g)(t)", steps, msg_id)
+        if png and os.path.exists(png):
+            success = await _safe_reply_photo(
+                update, png, f"Convolution: f(t)={e1} * g(t)={e2}")
+            if not success:
+                await _llm_fallback(update, question, "Convolution", msg_id)
         else:
-            png = _render_math_png("Convolution  (f * g)(t)", steps, msg_id)
-            if png and os.path.exists(png):
-                success = await _safe_reply_photo(
-                    update, png, f"Convolution: f(t)={e1} * g(t)={e2}")
-                if not success:
-                    text_result, _ = compute_convolution(e1, e2, msg_id)
-                    await send_long_code(update, text_result)
-            else:
-                text_result, plot_path2 = compute_convolution(e1, e2, msg_id)
-                await send_long_code(update, text_result)
-                plot_path = plot_path or plot_path2
-            if plot_path and os.path.exists(plot_path):
-                await _safe_reply_photo(update, plot_path,
-                                        "Numerical convolution (f * g)(t)")
+            await _llm_fallback(update, question, "Convolution", msg_id)
+        if plot_path and os.path.exists(plot_path):
+            await _safe_reply_photo(update, plot_path, "Numerical convolution (f * g)(t)")
         return
 
+    # ── Plot ──────────────────────────────────────────────────────────────────
     if is_plot(q_lower):
         await _safe_reply(update, "Generating plot…")
         fig_path = generate_plot(question, msg_id)
         if fig_path and os.path.exists(fig_path):
             success = await _safe_reply_photo(update, fig_path, f"{question}")
             if not success:
-                await _safe_reply(update,
-                    "Plot generated but could not be sent. Please try again.")
+                await _llm_fallback(update, question, "Tutor Answer", msg_id)
         else:
-            await _safe_reply(update,
-                "Could not parse that expression.\n"
-                "Examples: _plot 2*u(t-2)_  /  _draw u[n]-u[n-3]_",
-                parse_mode="Markdown")
+            # Plot failed — fall back to LLM instead of error message
+            await _llm_fallback(update, question, "Tutor Answer", msg_id)
         return
 
+    # ── Default: RAG / LLM ────────────────────────────────────────────────────
     if not qa_chain:
         await _safe_reply(update, "No knowledge base loaded.")
         return
@@ -2274,7 +2269,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if await _safe_reply_photo(update, png,
                                                         f"Inverse Laplace of {expr_str}"):
                                 return
-                    await send_long_code(update, compute_inv_laplace(expr_str or routed_command))
+                    await _llm_fallback(update, routed_command,
+                                        "Inverse Laplace Transform", msg_id)
                     return
 
             elif is_inv_fourier(q_lower):
@@ -2287,7 +2283,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if await _safe_reply_photo(update, png,
                                                         f"Inverse Fourier of {expr_str}"):
                                 return
-                    await send_long_code(update, compute_inv_fourier(expr_str or routed_command))
+                    await _llm_fallback(update, routed_command,
+                                        "Inverse Fourier Transform", msg_id)
                     return
 
             elif is_laplace(q_lower):
@@ -2300,7 +2297,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if await _safe_reply_photo(update, png,
                                                         f"Laplace of {expr_str}"):
                                 return
-                    await send_long_code(update, compute_laplace(expr_str))
+                    await _llm_fallback(update, routed_command, "Laplace Transform", msg_id)
                     return
 
             elif is_fourier(q_lower):
@@ -2313,7 +2310,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if await _safe_reply_photo(update, png,
                                                         f"Fourier of {expr_str}"):
                                 return
-                    await send_long_code(update, compute_fourier(expr_str))
+                    await _llm_fallback(update, routed_command, "Fourier Transform", msg_id)
                     return
 
             elif is_conv(q_lower):
@@ -2328,6 +2325,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await _safe_reply_photo(update, plot_path,
                                                      "Numerical convolution")
                         return
+                    await _llm_fallback(update, routed_command, "Convolution", msg_id)
+                    return
 
             elif is_plot(q_lower):
                 fig_path = generate_plot(routed_command, msg_id)
@@ -2335,18 +2334,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if await _safe_reply_photo(update, fig_path, f"{routed_command}"):
                         return
 
-            if qa_chain:
-                await _safe_reply(update, "Solving with tutor…")
-                try:
-                    answer = qa_chain.invoke(extracted)
-                    answer = _clean_llm_response(answer)
-                    answer = _latex_to_plain(answer)
-                    await send_llm_response(update, answer, "Tutor Answer", msg_id)
-                except Exception as e:
-                    await _safe_reply(update, f"{str(e)}")
-            else:
-                await _safe_reply(update,
-                    "No knowledge base loaded.")
+            # All routed attempts exhausted — fall back to LLM
+            await _llm_fallback(update, extracted, "Tutor Answer", msg_id)
+
         else:
             if sess:
                 context.user_data["pending_student_work"] = extracted
@@ -2403,7 +2393,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session_store(chat_id, extracted, source)
 
-    preview = extracted[:300].replace("\n", " ")
     await _safe_reply(update,
         f"Content loaded from *{source}*.\n\n"
         "Now tell me what you'd like:\n"
