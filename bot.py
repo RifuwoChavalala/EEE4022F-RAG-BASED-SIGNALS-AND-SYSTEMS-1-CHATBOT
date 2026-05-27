@@ -946,8 +946,6 @@ def _build_inv_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]
         result_tex = re.sub(r'\\theta\(t\)', r'u(t)', result_tex)
 
         steps.append(("Result", rf"f(t) = {result_tex}"))
-        steps.append(("Note",
-                       r"\text{Valid for } t \geq 0 \text{ (causal / right-sided signal)}"))
         return steps, ""
 
     except Exception as e:
